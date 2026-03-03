@@ -52,15 +52,7 @@ def parse_args():
     parser.add_argument("--llm_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--domain", type=str, default="mmlu")
     parser.add_argument("--decision_method", type=str, default="FinalRefer", help="Decision method for the graph.")
-    parser.add_argument(
-        "--execution_mode",
-        type=str,
-        default="default",
-        choices=["default", "allow_kv_reuse"],
-        help="Execution strategy for the graph.",
-    )
     parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "mmlu"), help="Directory to save the output results.")
-    parser.add_argument("--prefix", type=str, default="The task is:\n\n", help="The prefix text for the input query, kept the same as the default dense prefill mode.")
     parser.add_argument("--kv-threshold", type=float, default=None, help="Threshold for key-value memory usage.")
     parser.add_argument("--kv-max-anchor-num", type=int, default=20, help="Maximum number of anchors for key-value memory.")
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
@@ -101,13 +93,6 @@ async def main():
     download()
     dataset_val = MMLUDataset("val")
     limit_questions = 153
-    eval_kwargs = {}
-    if args.execution_mode == "allow_kv_reuse":
-        eval_kwargs = {
-            "prefix": args.prefix,
-            "output_dir": str(output_dir),
-        }
-
     configure_logging(log_path=output_dir / "logs/log.txt")
     timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     score = await evaluate(
@@ -115,15 +100,12 @@ async def main():
         dataset=dataset_val,
         limit_questions=limit_questions,
         eval_batch_size=args.batch_size,
-        mode=args.execution_mode,
-        **eval_kwargs,
     )
     logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
     result_file = output_dir / f"{args.domain}_{args.llm_name}_{timestamp}.json"
     result_file.touch(exist_ok=True)
     payload = {
         "score": score,
-        "execution_mode": args.execution_mode,
         "agent_names": args.agent_names,
         "agent_nums": args.agent_nums,
         "timestamp": timestamp,

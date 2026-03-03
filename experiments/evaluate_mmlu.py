@@ -19,9 +19,6 @@ async def evaluate(
     dataset,
     limit_questions: Optional[int] = None,
     eval_batch_size: int = 1,
-    *,
-    mode: str = "default",
-    **kwargs,
 ) -> float:
     """Evaluate a graph on the provided dataset."""
     logger.info(
@@ -61,14 +58,11 @@ async def evaluate(
             realized_graph.temporal_logits = graph.temporal_logits
             input_dict = dataset.record_to_input(record)
             input_dict["_batch_index"] = i_batch
-            mode_kwargs = kwargs if mode == "allow_kv_reuse" else {}
             tasks.append(
                 asyncio.create_task(
                     realized_graph.arun(
                         input_dict,
                         1,
-                        mode=mode,
-                        **mode_kwargs,
                     )
                 )
             )

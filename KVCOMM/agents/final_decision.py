@@ -6,7 +6,6 @@ from KVCOMM.llm.llm_registry import LLMRegistry
 from KVCOMM.prompt.prompt_set_registry import PromptSetRegistry
 from KVCOMM.tools.coding.python_executor import execute_code_get_return, PyExecutor
 from KVCOMM.llm.config import KVCommConfig
-from KVCOMM.utils.metrics import GenerationResult
 from KVCOMM.utils.log import logger
 
 @AgentRegistry.register('FinalWriteCode')
@@ -97,129 +96,9 @@ class FinalWriteCode(Node):
         raw_inputs:Dict[str,str],
         spatial_info:Dict[str,Any],
         temporal_info:Dict[str,Any],
-        mode: str = "default",
         **kwargs,
     )->Dict[str, Any]:
-        """ To be overriden by the descendant class """
-        """ Process the raw_inputs(most of the time is a List[Dict]) """
-
-        if mode == "allow_kv_reuse":
-            request_uid = raw_inputs.get("_request_uid") or kwargs.get("request_uid")
-            if request_uid is None:
-                raise ValueError("request_uid is required for request-scoped anchor updates.")
-
-            preferred_mode = "kv_reuse"
-            agent_memory = self.llm._ensure_agent_memory(self.id)
-            prefix_text = kwargs.get("prefix", "")
-
-            has_shared_prefix = (
-                self.llm.has_prefix_initialized(self.id)
-                and "placeholder_info" in agent_memory
-            )
-            early_response: str | None = None
-
-            if has_shared_prefix:
-                task = raw_inputs["task"]
-                for agent_id, info in spatial_info.items():
-                    cond_text: str | None = None
-                    cond_prefix: str | None = None
-
-                    if self.domain == "gsm8k" and info["role"] == "Programming Expert":
-                        answer = execute_code_get_return(
-                            info["output"].split("```python\n")[-1].split("\n```")[0]
-                        )
-                        if answer is None:
-                            answer = "No variable is named answer."
-                        cond_text = f"the answer is {answer}"
-                        cond_prefix = "the answer is "
-                    elif (
-                        self.domain == "humaneval"
-                        and self.role not in {"Normal Programmer", "Stupid Programmer"}
-                        and info["role"] != "Algorithm Designer"
-                    ):
-                        code = info["output"].split("```python\n")[-1].split("\n```")[0]
-                        is_solved, feedback, _ = PyExecutor().execute(
-                            code, getattr(self, "internal_tests", []), timeout=10
-                        )
-                        cond_text = (
-                            "Whether it passes internal testing?\n"
-                            f"{is_solved}.\n\nThe feedback is:\n\n {feedback}."
-                        )
-                        cond_prefix = "Whether it passes internal testing?\n"
-
-                    if cond_text and cond_prefix:
-                        self.llm.update_condition_anchor(
-                            request_uid=request_uid,
-                            owner_agent_id=agent_id,
-                            message=task,
-                            content=cond_text,
-                            prefix_text=cond_prefix,
-                        )
-
-                user_content = prefix_text + raw_inputs["task"]
-                preferred_mode = self.llm.update_input_anchor(
-                    request_uid=request_uid,
-                    agent_id=self.id,
-                    message=raw_inputs["task"],
-                    user_content=user_content,
-                    prefix_text=prefix_text,
-                )
-                logger.opt(colors=True).info(
-                    "<green>[MODE]</green> Task: {} Agent {} ({}) mode: {}",
-                    raw_inputs["task"],
-                    self.id,
-                    self.role,
-                    preferred_mode,
-                )
-                return {
-                    "preferred_mode": preferred_mode,
-                    "early_response": early_response,
-                }
-
-            system_prompt = self.prompt_set.get_decision_role()
-            self.constraint = self.prompt_set.get_decision_constraint()
-            system_prompt = f"{system_prompt}.\n {self.constraint}"
-            user_input = "{user_question}"
-            spatial_str = ""
-            decision_few_shot = self.prompt_set.get_decision_few_shot()
-
-            spatial_str = ""
-            if self.domain in {"gsm8k", "mmlu"}:
-                for agent_id, info in spatial_info.items():
-                    agent_output = info["output"] if info["output"] else "{agent_" + agent_id + "_current}"
-                    if info["role"] == "Programming Expert":
-                        agent_output += "\n the result is {condition_" + agent_id + "_current}"
-                    spatial_str += (
-                        f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"
-                    )
-            elif self.domain == "humaneval":
-                for agent_id, info in spatial_info.items():
-                    agent_output = info["output"] if info["output"] else "{agent_" + agent_id + "_current}"
-                    if (
-                        self.role not in {"Normal Programmer", "Stupid Programmer"}
-                        and info["role"] != "Algorithm Designer"
-                    ):
-                        condition = "{condition_" + agent_id + "_current}"
-                        spatial_str += (
-                            f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"
-                            f"{agent_output}\n\n Whether it passes internal testing?\n{condition}\n\n"
-                        )
-                    else:
-                        spatial_str += (
-                            f"Agent {agent_id} as a {info['role']} provides the following info: {agent_output}\n\n"
-                        )
-
-            decision_few_shot = self.prompt_set.get_decision_few_shot()
-            user_prompt = (
-                f"{decision_few_shot} {prefix_text} {user_input}\n At the same time, the output of other agents is as follows:\n\n"
-                f"{spatial_str}\n\n"
-            )
-            await self.llm.prepare_prefix_kv_segments(self.id, system_prompt, user_prompt)
-            return {
-                "preferred_mode": preferred_mode,
-                "early_response": early_response,
-            }
-
+        """Process the raw inputs in default mode."""
         system_prompt = self.prompt_set.get_decision_role()
         self.constraint = self.prompt_set.get_decision_constraint()
         system_prompt = f"{system_prompt}.\n {self.constraint}"
@@ -264,7 +143,6 @@ class FinalWriteCode(Node):
         return {
             "system_prompt": system_prompt,
             "user_prompt": user_prompt,
-            "early_response": early_response,
         }
 
     def _execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any],**kwargs):
@@ -275,7 +153,6 @@ class FinalWriteCode(Node):
                 input,
                 spatial_info,
                 temporal_info,
-                mode="default",
                 **kwargs,
             )
         )
@@ -286,51 +163,28 @@ class FinalWriteCode(Node):
         response = self.llm.gen(message)
         return response
 
-    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], mode: str = "default", **kwargs):
+    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
         """ To be overriden by the descendant class """
         """ Use the processed input to get the result """
-        if mode == "default":
-            request_uid = input.get("_request_uid")
-            inputs = await self._process_inputs(
-                input,
-                spatial_info,
-                temporal_info,
-                mode=mode,
-                **kwargs,
-            )
-            message = [
-                {"role": "system", "content": inputs["system_prompt"]},
-                {"role": "user", "content": inputs["user_prompt"]},
-            ]
-            result = await self.llm.agen(
-                message,
-                request_uid=request_uid,
-                agent_id=self.id,
-                agent_name=self.agent_name,
-                agent_role=self.role,
-            )
-            return result
-
-        mode_data = await self._process_inputs(
+        request_uid = input.get("_request_uid")
+        inputs = await self._process_inputs(
             input,
             spatial_info,
             temporal_info,
-            mode=mode,
             **kwargs,
         )
-        request_uid = input.get("_request_uid") or kwargs.get("request_uid")
-        if request_uid is None:
-            raise ValueError("request_uid is required for request-scoped anchor updates.")
-        result = await self.llm.generate_for_agent(
+        message = [
+            {"role": "system", "content": inputs["system_prompt"]},
+            {"role": "user", "content": inputs["user_prompt"]},
+        ]
+        result = await self.llm.agen(
+            message,
             request_uid=request_uid,
-            message=input["task"],
-            preferred_mode=mode_data["preferred_mode"],
-            output_dir=kwargs.get("output_dir"),
             agent_id=self.id,
             agent_name=self.agent_name,
             agent_role=self.role,
         )
-        return input["task"], result
+        return result
 
 
 @AgentRegistry.register('FinalRefer')
@@ -355,128 +209,10 @@ class FinalRefer(Node):
         raw_inputs:Dict[str,str],
         spatial_info:Dict[str,Any],
         temporal_info:Dict[str,Any],
-        mode: str = "default",
         **kwargs,
     )->Dict[str, Any]:
         """ To be overriden by the descendant class """
         """ Process the raw_inputs(most of the time is a List[Dict]) """
-        if mode == "allow_kv_reuse":
-            request_uid = raw_inputs.get("_request_uid") or kwargs.get("request_uid")
-            if request_uid is None:
-                raise ValueError("request_uid is required for request-scoped anchor updates.")
-
-            preferred_mode = "kv_reuse"
-            agent_memory = self.llm._ensure_agent_memory(self.id)
-            prefix_text = kwargs.get("prefix", "")
-
-            has_shared_prefix = (
-                self.llm.has_prefix_initialized(self.id)
-                and "placeholder_info" in agent_memory
-            )
-            early_response: str | None = None
-
-            if has_shared_prefix:
-                task = raw_inputs["task"]
-                for agent_id, info in spatial_info.items():
-                    cond_text: str | None = None
-                    cond_prefix: str | None = None
-
-                    if self.domain == "gsm8k" and info["role"] == "Programming Expert":
-                        answer = execute_code_get_return(
-                            info["output"].split("```python\n")[-1].split("\n```")[0]
-                        )
-                        if answer is None:
-                            answer = "No variable is named answer."
-                        cond_text = f"the answer is {answer}"
-                        cond_prefix = "the answer is "
-                    elif (
-                        self.domain == "humaneval"
-                        and self.role not in {"Normal Programmer", "Stupid Programmer"}
-                        and info["role"] != "Algorithm Designer"
-                    ):
-                        code = info["output"].split("```python\n")[-1].split("\n```")[0]
-                        is_solved, feedback, _ = PyExecutor().execute(
-                            code, getattr(self, "internal_tests", []), timeout=10
-                        )
-                        cond_text = (
-                            "Whether it passes internal testing?\n"
-                            f"{is_solved}.\n\nThe feedback is:\n\n {feedback}."
-                        )
-                        cond_prefix = "Whether it passes internal testing?\n"
-
-                    if cond_text and cond_prefix:
-                        self.llm.update_condition_anchor(
-                            request_uid=request_uid,
-                            owner_agent_id=agent_id,
-                            message=task,
-                            content=cond_text,
-                            prefix_text=cond_prefix,
-                        )
-
-                user_content = prefix_text + raw_inputs["task"]
-                preferred_mode = self.llm.update_input_anchor(
-                    request_uid=request_uid,
-                    agent_id=self.id,
-                    message=raw_inputs["task"],
-                    user_content=user_content,
-                    prefix_text=prefix_text,
-                )
-                logger.opt(colors=True).info(
-                    "<green>[MODE]</green> Task: {} Agent {} ({}) mode: {}",
-                    raw_inputs["task"],
-                    self.id,
-                    self.role,
-                    preferred_mode,
-                )
-                return {
-                    "preferred_mode": preferred_mode,
-                    "early_response": early_response,
-                }
-
-            system_prompt = self.prompt_set.get_decision_role()
-            self.constraint = self.prompt_set.get_decision_constraint()
-            system_prompt = f"{system_prompt}.\n {self.constraint}"
-            user_input = "{user_question}"
-            spatial_str = ""
-            decision_few_shot = self.prompt_set.get_decision_few_shot()
-
-            spatial_str = ""
-            if self.domain in {"gsm8k", "mmlu"}:
-                for agent_id, info in spatial_info.items():
-                    agent_output = info["output"] if info["output"] else "{agent_" + agent_id + "_current}"
-                    if info["role"] == "Programming Expert":
-                        agent_output += "\n the result is {condition_" + agent_id + "_current}"
-                    spatial_str += (
-                        f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"
-                    )
-            elif self.domain == "humaneval":
-                for agent_id, info in spatial_info.items():
-                    agent_output = info["output"] if info["output"] else "{agent_" + agent_id + "_current}"
-                    if (
-                        self.role not in {"Normal Programmer", "Stupid Programmer"}
-                        and info["role"] != "Algorithm Designer"
-                    ):
-                        condition = "{condition_" + agent_id + "_current}"
-                        spatial_str += (
-                            f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"
-                            f"{agent_output}\n\n Whether it passes internal testing?\n{condition}\n\n"
-                        )
-                    else:
-                        spatial_str += (
-                            f"Agent {agent_id} as a {info['role']} provides the following info: {agent_output}\n\n"
-                        )
-
-            decision_few_shot = self.prompt_set.get_decision_few_shot()
-            user_prompt = (
-                f"{decision_few_shot} {prefix_text} {user_input}\n At the same time, the output of other agents is as follows:\n\n"
-                f"{spatial_str}\n\n"
-            )
-            await self.llm.prepare_prefix_kv_segments(self.id, system_prompt, user_prompt)
-            return {
-                "preferred_mode": preferred_mode,
-                "early_response": early_response,
-            }
-
         system_prompt = self.prompt_set.get_decision_role()
         self.constraint = self.prompt_set.get_decision_constraint()
         system_prompt = f"{system_prompt}.\n {self.constraint}"
@@ -547,7 +283,6 @@ class FinalRefer(Node):
                 input,
                 spatial_info,
                 temporal_info,
-                mode="default",
                 **kwargs,
             )
         )
@@ -555,57 +290,26 @@ class FinalRefer(Node):
         response = self.llm.gen(message)
         return response
 
-    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], mode: str = "default", **kwargs):
+    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
         """Handle asynchronous execution across different KV cache strategies."""
         if self.domain == 'humaneval':
             self.internal_tests = self.extract_example(input)
-        if mode == "default":
-            request_uid = input.get("_request_uid")
-            inputs = await self._process_inputs(
-                input,
-                spatial_info,
-                temporal_info,
-                mode=mode,
-                **kwargs,
-            )
-            message = [{'role':'system','content':inputs["system_prompt"]},{'role':'user','content':inputs["user_prompt"]}]
-            result = await self.llm.agen(
-                message,
-                request_uid=request_uid,
-                agent_id=self.id,
-                agent_name=self.agent_name,
-                agent_role=self.role,
-            )
-            return result
-
-        request_uid = input.get("_request_uid") or kwargs.get("request_uid")
-        if request_uid is None:
-            raise ValueError("request_uid is required for request-scoped anchor updates.")
-
-        mode_data = await self._process_inputs(
+        request_uid = input.get("_request_uid")
+        inputs = await self._process_inputs(
             input,
             spatial_info,
             temporal_info,
-            mode="allow_kv_reuse",
             **kwargs,
         )
-        if mode_data["early_response"] is not None:
-            early = GenerationResult(
-                text=mode_data["early_response"],
-                mode="kv_reuse" if mode == "allow_kv_reuse" else mode,
-                ttft=0.0,
-            )
-            return input['task'], early
-        result = await self.llm.generate_for_agent(
+        message = [{'role':'system','content':inputs["system_prompt"]},{'role':'user','content':inputs["user_prompt"]}]
+        result = await self.llm.agen(
+            message,
             request_uid=request_uid,
-            message=input['task'],
-            preferred_mode=mode_data["preferred_mode"],
-            output_dir=kwargs.get("output_dir"),
             agent_id=self.id,
             agent_name=self.agent_name,
             agent_role=self.role,
         )
-        return input['task'], result
+        return result
 
 @AgentRegistry.register('FinalDirect')
 class FinalDirect(Node):
@@ -630,7 +334,7 @@ class FinalDirect(Node):
             output = info_list[-1]
         return output
 
-    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], mode: str = "default", **kwargs):
+    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
         """ To be overriden by the descendant class """
         """ Use the processed input to get the result """
         output = ""
@@ -639,8 +343,6 @@ class FinalDirect(Node):
             info_list.append(info['output'])
         if len(info_list):
             output = info_list[-1]
-        if mode == "allow_kv_reuse":
-            return input.get("task"), output
         return output
 
 
@@ -673,7 +375,7 @@ class FinalMajorVote(Node):
                 max_output_num = output_num[processed_output]
         return max_output
 
-    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], mode: str = "default", **kwargs):
+    async def _async_execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
         """ To be overriden by the descendant class """
         """ Use the processed input to get the result """
         output_num = {}
@@ -689,6 +391,4 @@ class FinalMajorVote(Node):
             if output_num[processed_output] > max_output_num:
                 max_output = processed_output
                 max_output_num = output_num[processed_output]
-        if mode == "allow_kv_reuse":
-            return input.get("task"), max_output
         return max_output

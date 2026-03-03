@@ -114,21 +114,15 @@ class Node(ABC):
         self.last_memory['outputs'] = self.outputs
         self.last_memory['raw_inputs'] = self.raw_inputs
 
-    def update_memory_multirequest(self, message:str):
-        """Update per-message memories when running in multi-request mode."""
-        if message not in self.last_memory:
-            self.last_memory[message] = {}
-        self.last_memory[message]['outputs'] = self.outputs[message]
-
-    def get_spatial_info(self, message=None, prefix=False)->Dict[str,Dict]:
+    def get_spatial_info(self)->Dict[str,Dict]:
         """ Return a dict that maps id to info. """
         spatial_info = {}
         if self.spatial_predecessors is not None:
             for predecessor in self.spatial_predecessors:
-                predecessor_outputs = predecessor.outputs if message is None else predecessor.outputs[message]
+                predecessor_outputs = predecessor.outputs
                 if isinstance(predecessor_outputs, list) and len(predecessor_outputs):
                     predecessor_output = predecessor_outputs[-1]
-                elif isinstance(predecessor_outputs, list) and len(predecessor_outputs)==0 and not prefix:
+                elif isinstance(predecessor_outputs, list) and len(predecessor_outputs)==0:
                     continue
                 else:
                     predecessor_output = predecessor_outputs
@@ -136,14 +130,14 @@ class Node(ABC):
 
         return spatial_info
 
-    def get_temporal_info(self, message=None, prefix=False)->Dict[str,Any]:
+    def get_temporal_info(self)->Dict[str,Any]:
         temporal_info = {}
         if self.temporal_predecessors is not None:
             for predecessor in self.temporal_predecessors:
-                predecessor_outputs = predecessor.last_memory['outputs'] if message is None else predecessor.last_memory[message]['outputs']
+                predecessor_outputs = predecessor.last_memory['outputs']
                 if isinstance(predecessor_outputs, list) and len(predecessor_outputs):
                     predecessor_output = predecessor_outputs[-1]
-                elif isinstance(predecessor_outputs, list) and len(predecessor_outputs)==0 and not prefix:
+                elif isinstance(predecessor_outputs, list) and len(predecessor_outputs)==0:
                     continue
                 else:
                     predecessor_output = predecessor_outputs
@@ -164,99 +158,40 @@ class Node(ABC):
             self.outputs.extend(result)
         return self.outputs
 
-    async def async_execute(self, input:Any, mode: str = "default", **kwargs):
-        """Execute a node asynchronously with optional KV cache handling modes."""
-        if mode == "default":
-            self.outputs = []
-            spatial_info:Dict[str,Any] = self.get_spatial_info()
-            temporal_info:Dict[str,Any] = self.get_temporal_info()
-            tasks = [
-                asyncio.create_task(
-                    self._async_execute(input, spatial_info, temporal_info, mode=mode, **kwargs)
-                )
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-            request_uid = input.get("_request_uid") or kwargs.get("request_uid")
-            for result in results:
-                if not isinstance(result, list):
-                    result = [result]
-                for item in result:
-                    if isinstance(item, GenerationResult):
-                        generation = item
-                    else:
-                        generation = GenerationResult(
-                            text=str(item),
-                            mode="default",
-                            ttft=0.0,
-                        )
-                    self.outputs.append(generation.text)
-                    if request_uid:
-                        metrics_recorder.record_agent_output(
-                            request_uid=request_uid,
-                            agent_id=self.id,
-                            agent_name=self.agent_name,
-                            agent_role=self.role,
-                            generation=generation,
-                        )
-            return self.outputs
-
-        if mode == "allow_kv_reuse":
-            self.outputs = {}
-            spatial_info:Dict[str,Any] = self.get_spatial_info(input['task'])
-            temporal_info:Dict[str,Any] = self.get_temporal_info(input['task'])
-            tasks = [
-                asyncio.create_task(
-                    self._async_execute(
-                        input,
-                        spatial_info,
-                        temporal_info,
-                        mode=mode,
-                        **kwargs,
+    async def async_execute(self, input:Any, **kwargs):
+        """Execute a node asynchronously."""
+        self.outputs = []
+        spatial_info:Dict[str,Any] = self.get_spatial_info()
+        temporal_info:Dict[str,Any] = self.get_temporal_info()
+        tasks = [
+            asyncio.create_task(
+                self._async_execute(input, spatial_info, temporal_info, **kwargs)
+            )
+        ]
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        request_uid = input.get("_request_uid")
+        for result in results:
+            if not isinstance(result, list):
+                result = [result]
+            for item in result:
+                if isinstance(item, GenerationResult):
+                    generation = item
+                else:
+                    generation = GenerationResult(
+                        text=str(item),
+                        mode="default",
+                        ttft=0.0,
                     )
-                )
-            ]
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-            request_uid = input.get("_request_uid") or kwargs.get("request_uid")
-            for (message, result) in results:
-                if not isinstance(result, list):
-                    result = [result]
-                if message not in self.outputs:
-                    self.outputs[message] = []
-                for item in result:
-                    if isinstance(item, GenerationResult):
-                        generation = item
-                    else:
-                        generation = GenerationResult(
-                            text=str(item),
-                            mode="kv_reuse" if mode == "allow_kv_reuse" else mode,
-                            ttft=0.0,
-                        )
-                    self.outputs[message].append(generation.text)
-                    if request_uid:
-                        metrics_recorder.record_agent_output(
-                            request_uid=request_uid,
-                            agent_id=self.id,
-                            agent_name=self.agent_name,
-                            agent_role=self.role,
-                            generation=generation,
-                        )
-            return self.outputs
-
-        if mode == "initialization":
-            self.outputs = []
-            spatial_info:Dict[str,Any] = self.get_spatial_info(prefix=True)
-            temporal_info:Dict[str,Any] = self.get_temporal_info(prefix=True)
-            if hasattr(self.llm, "_initialization") and not self.llm._initialization[self.id]:
-                await self._process_inputs(
-                    input,
-                    spatial_info,
-                    temporal_info,
-                    mode="allow_kv_reuse",
-                    **kwargs,
-                )
-            return self.outputs
-
-        raise ValueError(f"Unsupported async execution mode: {mode}")
+                self.outputs.append(generation.text)
+                if request_uid:
+                    metrics_recorder.record_agent_output(
+                        request_uid=request_uid,
+                        agent_id=self.id,
+                        agent_name=self.agent_name,
+                        agent_role=self.role,
+                        generation=generation,
+                    )
+        return self.outputs
 
     @abstractmethod
     def _execute(self, input:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
@@ -264,7 +199,7 @@ class Node(ABC):
         """ Use the processed input to get the result """
 
     @abstractmethod
-    async def _async_execute(self, input:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], mode: str = "default", **kwargs):
+    async def _async_execute(self, input:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
         """ To be overriden by the descendant class """
         """ Use the processed input to get the result """
 

@@ -1,0 +1,28 @@
+# Python cache/artifacts
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Local env/config
+.env
+.env.*
+
+# Experiment outputs
+runs/
+*.log
+
+# Dataset files (keep dataset scripts)
+datasets/MMLU/data/
+datasets/MMLU/data.tar
+datasets/gsm8k/*.jsonl
+datasets/humaneval/*.jsonl
+
+# IDE/OS
+.idea/
+.vscode/
+.DS_Store

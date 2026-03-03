@@ -20,13 +20,13 @@ class GenerationResult:
 
 
 class RequestMetricsRecorder:
-    """Tracks per-request agent outputs, reuse rates, and mode-specific TTFT."""
+    """Tracks per-request agent outputs, default-mode rates, and mode-specific TTFT."""
 
     def __init__(self) -> None:
         self._lock = Lock()
         self._requests: Dict[str, Dict[str, Any]] = {}
         self._total_calls: int = 0
-        self._total_reuse_calls: int = 0
+        self._total_default_calls: int = 0
         self._ttft_stats: Dict[str, Dict[str, float]] = {}
 
     def start_request(
@@ -44,7 +44,7 @@ class RequestMetricsRecorder:
                 "task": task,
                 "execution_mode": execution_mode,
                 "agents": [],
-                "kv_reuse_count": 0,
+                "default_count": 0,
                 "total_count": 0,
             }
 
@@ -69,7 +69,7 @@ class RequestMetricsRecorder:
                     "task": None,
                     "execution_mode": "unknown",
                     "agents": [],
-                    "kv_reuse_count": 0,
+                    "default_count": 0,
                     "total_count": 0,
                 },
             )
@@ -96,8 +96,8 @@ class RequestMetricsRecorder:
 
 
             request_entry["total_count"] = len(agents_list)
-            request_entry["kv_reuse_count"] = sum(
-                1 for entry in agents_list if entry.get("mode") == "kv_reuse"
+            request_entry["default_count"] = sum(
+                1 for entry in agents_list if entry.get("mode") == "default"
             )
 
 
@@ -144,50 +144,50 @@ class RequestMetricsRecorder:
             )
 
     def finalize_request(self, request_uid: str) -> Optional[float]:
-        """Compute and log per-request reuse statistics."""
+        """Compute and log per-request default-mode statistics."""
         with self._lock:
             request_entry = self._requests.pop(request_uid, None)
             if request_entry is None:
                 return None
 
-            kv_reuse = request_entry.get("kv_reuse_count", 0)
+            default_count = request_entry.get("default_count", 0)
             total = request_entry.get("total_count", 0)
-            reuse_rate = (kv_reuse / total) if total else 0.0
+            default_rate = (default_count / total) if total else 0.0
 
             payload = {
                 "request_uid": request_uid,
                 "batch_index": request_entry.get("batch_index"),
                 "task": request_entry.get("task"),
                 "execution_mode": request_entry.get("execution_mode"),
-                "reuse_rate": reuse_rate,
-                "kv_reuse_count": kv_reuse,
+                "default_rate": default_rate,
+                "default_count": default_count,
                 "total_agents": total,
             }
             logger.opt(colors=True).info(
-                "<magenta>[REQUEST REUSE]</magenta> {}",
+                "<magenta>[REQUEST MODE]</magenta> {}",
                 json.dumps(payload, ensure_ascii=False),
             )
 
             self._total_calls += total
-            self._total_reuse_calls += kv_reuse
-            return reuse_rate
+            self._total_default_calls += default_count
+            return default_rate
 
     def log_cumulative(self, *, batch_index: Optional[int]) -> float:
-        """Log the cumulative average reuse rate across all processed requests."""
+        """Log the cumulative average default-mode rate across all requests."""
         with self._lock:
             if self._total_calls == 0:
                 cumulative = 0.0
             else:
-                cumulative = self._total_reuse_calls / self._total_calls
+                cumulative = self._total_default_calls / self._total_calls
 
             payload = {
                 "batch_index": batch_index,
-                "cumulative_reuse_rate": cumulative,
-                "kv_reuse_calls": self._total_reuse_calls,
+                "cumulative_default_rate": cumulative,
+                "default_calls": self._total_default_calls,
                 "total_agent_calls": self._total_calls,
             }
             logger.opt(colors=True).info(
-                "<yellow>[CUMULATIVE REUSE]</yellow> {}",
+                "<yellow>[CUMULATIVE MODE]</yellow> {}",
                 json.dumps(payload, ensure_ascii=False),
             )
             return cumulative

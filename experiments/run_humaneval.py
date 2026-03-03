@@ -8,7 +8,7 @@ sys.stdout.reconfigure(encoding='utf-8')
 import random
 import time
 from pathlib import Path
-from typing import List, Literal, Optional, Union
+from typing import List, Literal, Union
 
 import numpy as np
 import torch
@@ -70,15 +70,7 @@ def parse_args():
         help="List of agent counts corresponding to agent names.",
     )
     parser.add_argument("--decision_method", type=str, default="FinalRefer", help="Decision method for the graph.")
-    parser.add_argument(
-        "--execution_mode",
-        type=str,
-        default="default",
-        choices=["default", "allow_kv_reuse"],
-        help="Execution strategy for the graph.",
-    )
     parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "humaneval"), help="Directory to save the output results.")
-    parser.add_argument("--prefix", type=str, default="The task is:\n\n", help="The prefix text for the input query, kept the same as the default dense prefill mode.")
     parser.add_argument("--kv-threshold", type=float, default=None, help="Threshold for key-value memory usage.")
     parser.add_argument("--kv-max-anchor-num", type=int, default=None, help="Maximum number of anchors for key-value memory.")
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
@@ -101,22 +93,17 @@ async def main():
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
     result_file = output_dir / f"{args.domain}_{args.llm_name}_{current_time}.json"
-    latency_target = str(output_dir)
 
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
 
-    kv_config: Optional[KVCommConfig] = None
-    if args.execution_mode == "allow_kv_reuse":
-        kv_config = KVCommConfig.from_env().apply_overrides(
-            threshold=args.kv_threshold,
-            max_anchor_num=args.kv_max_anchor_num,
-            window_size=args.kv_window_size,
-            thread_pool_workers=args.kv_thread_workers,
-            worker_timeout=args.kv_worker_timeout,
-        )
-    else:
-        kv_config = KVCommConfig.from_env()
+    kv_config = KVCommConfig.from_env().apply_overrides(
+        threshold=args.kv_threshold,
+        max_anchor_num=args.kv_max_anchor_num,
+        window_size=args.kv_window_size,
+        thread_pool_workers=args.kv_thread_workers,
+        worker_timeout=args.kv_worker_timeout,
+    )
 
     graph = Graph(
         domain=args.domain,
@@ -148,20 +135,11 @@ async def main():
             tests = record["test"]
             input_dict = {"task": task, "_batch_index": i_batch}
 
-            mode_kwargs = {}
-            if args.execution_mode == "allow_kv_reuse":
-                mode_kwargs = {
-                    "prefix": args.prefix,
-                    "output_dir": latency_target
-                }
-
             tasks.append(
                 asyncio.create_task(
                     realized_graph.arun(
                         input_dict,
                         1,
-                        mode=args.execution_mode,
-                        **mode_kwargs,
                     )
                 )
             )

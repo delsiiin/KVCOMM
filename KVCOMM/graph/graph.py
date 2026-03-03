@@ -9,7 +9,6 @@ import copy
 from KVCOMM.graph.node import Node
 from KVCOMM.agents.agent_registry import AgentRegistry
 from KVCOMM.llm.config import KVCommConfig
-from KVCOMM.llm.gpt_chat import LLMChat
 from KVCOMM.utils.metrics import metrics_recorder
 from KVCOMM.utils.log import logger
 
@@ -33,8 +32,8 @@ class Graph(ABC):
         build_graph(): Method to be implemented for constructing the graph structure.
         add_node(node): Adds a new node to the graph with a unique identifier.
         run(inputs, num_rounds=1, max_tries=3, max_time=600): Executes the graph for a specified number of rounds, processing provided inputs.
-        arun(input, num_rounds=1, max_tries=3, max_time=600, *, mode="default", **kwargs): Asynchronously executes the graph for a specified number of rounds, processing provided inputs.
-        update_memory(message=None): Propagates memory update across nodes; supports multi-request keys.
+        arun(input, num_rounds=1, max_tries=3, max_time=600): Asynchronously executes the graph for a specified number of rounds, processing provided inputs.
+        update_memory(): Propagates memory update across nodes.
         check_cycle(new_node, target_nodes): Detects if adding edges would create a cycle starting at `new_node`.
         update_masks(): Returns current spatial and temporal mask parameters.
         __getstate__(): Returns the state of the graph.
@@ -264,79 +263,21 @@ class Graph(ABC):
         num_rounds: int = 1,
         max_tries: int = 3,
         max_time: int = 600,
-        *,
-        mode: str = "default",
-        **kwargs,
-    ) -> List[Any]:
-        """Asynchronous execution entry supporting standard and KV-reuse workflows."""
-        if mode == "default":
-            request_uid = input.setdefault(
-                "_request_uid", shortuuid.ShortUUID().random(length=8)
-            )
-            metrics_recorder.start_request(
-                request_uid=request_uid,
-                batch_index=input.get("_batch_index"),
-                task=input.get("task"),
-                execution_mode=mode,
-            )
-            for round in range(num_rounds):
-                self.construct_spatial_connection()
-                self.construct_temporal_connection(round)
-
-                in_degree = {
-                    node_id: len(node.spatial_predecessors)
-                    for node_id, node in self.nodes.items()
-                }
-                zero_in_degree_queue = [
-                    node_id for node_id, deg in in_degree.items() if deg == 0
-                ]
-
-                while zero_in_degree_queue:
-                    current_node_id = zero_in_degree_queue.pop(0)
-                    tries = 0
-                    while tries < max_tries:
-                        await asyncio.wait_for(
-                            self.nodes[current_node_id].async_execute(input),
-                            timeout=max_time,
-                        )
-                        break
-                    for successor in self.nodes[current_node_id].spatial_successors:
-                        if successor.id not in self.nodes:
-                            continue
-                        in_degree[successor.id] -= 1
-                        if in_degree[successor.id] == 0:
-                            zero_in_degree_queue.append(successor.id)
-
-                self.update_memory()
-            if self.decision_node:
-                self.connect_decision_node()
-                await self.decision_node.async_execute(input)
-                final_answers = self.decision_node.outputs
-                if len(final_answers) == 0:
-                    final_answers.append("No answer of the decision node")
-                metrics_recorder.finalize_request(request_uid)
-            else:
-                final_answers = self.nodes[list(self.nodes.keys())[-1]].outputs
-                metrics_recorder.finalize_request(request_uid)
-            return {
-                "task": input.get("task"),
-                "answers": final_answers,
-            }
-
-        if mode == "allow_kv_reuse":
-            request_uid = input.setdefault(
-                "_request_uid", shortuuid.ShortUUID().random(length=8)
-            )
-            kwargs = dict(kwargs)
-            kwargs.setdefault("request_uid", request_uid)
-            metrics_recorder.start_request(
-                request_uid=request_uid,
-                batch_index=input.get("_batch_index"),
-                task=input.get("task"),
-                execution_mode=mode,
-            )
+    ) -> Dict[str, Any]:
+        """Asynchronous execution entry supporting default workflow only."""
+        request_uid = input.setdefault(
+            "_request_uid", shortuuid.ShortUUID().random(length=8)
+        )
+        metrics_recorder.start_request(
+            request_uid=request_uid,
+            batch_index=input.get("_batch_index"),
+            task=input.get("task"),
+            execution_mode="default",
+        )
+        for round in range(num_rounds):
             self.construct_spatial_connection()
-            self.construct_temporal_connection(0)
+            self.construct_temporal_connection(round)
+
             in_degree = {
                 node_id: len(node.spatial_predecessors)
                 for node_id, node in self.nodes.items()
@@ -344,88 +285,45 @@ class Graph(ABC):
             zero_in_degree_queue = [
                 node_id for node_id, deg in in_degree.items() if deg == 0
             ]
+
             while zero_in_degree_queue:
                 current_node_id = zero_in_degree_queue.pop(0)
-                await asyncio.wait_for(
-                    self.nodes[current_node_id].async_execute(
-                        input, mode="initialization", **kwargs
-                    ),
-                    timeout=max_time,
-                )
+                tries = 0
+                while tries < max_tries:
+                    await asyncio.wait_for(
+                        self.nodes[current_node_id].async_execute(input),
+                        timeout=max_time,
+                    )
+                    break
                 for successor in self.nodes[current_node_id].spatial_successors:
                     if successor.id not in self.nodes:
                         continue
                     in_degree[successor.id] -= 1
                     if in_degree[successor.id] == 0:
                         zero_in_degree_queue.append(successor.id)
-            if self.decision_node:
-                self.connect_decision_node()
-                await self.decision_node.async_execute(
-                    input, mode="initialization", **kwargs
-                )
 
-            for round in range(num_rounds):
-                self.construct_spatial_connection()
-                self.construct_temporal_connection(round)
+            self.update_memory()
 
-                in_degree = {
-                    node_id: len(node.spatial_predecessors)
-                    for node_id, node in self.nodes.items()
-                }
-                zero_in_degree_queue = [
-                    node_id for node_id, deg in in_degree.items() if deg == 0
-                ]
-
-                while zero_in_degree_queue:
-                    current_node_id = zero_in_degree_queue.pop(0)
-                    tries = 0
-                    while tries < max_tries:
-                        await asyncio.wait_for(
-                            self.nodes[current_node_id].async_execute(
-                                input, mode="allow_kv_reuse", **kwargs
-                            ),
-                            timeout=max_time,
-                        )
-                        break
-                    for successor in self.nodes[current_node_id].spatial_successors:
-                        if successor.id not in self.nodes:
-                            continue
-                        in_degree[successor.id] -= 1
-                        if in_degree[successor.id] == 0:
-                            zero_in_degree_queue.append(successor.id)
-
-                self.update_memory(message=input["task"])
-
-            if self.decision_node:
-                self.connect_decision_node()
-                await self.decision_node.async_execute(
-                    input, mode="allow_kv_reuse", **kwargs
-                )
-                final_answers = self.decision_node.outputs[input["task"]]
-                if len(final_answers) == 0:
-                    final_answers.append("No answer of the decision node")
-                LLMChat.finalize_request(request_uid)
-                metrics_recorder.finalize_request(request_uid)
-            else:
-                final_answers = self.nodes[list(self.nodes.keys())[-1]].outputs
-                LLMChat.finalize_request(request_uid)
-                metrics_recorder.finalize_request(request_uid)
-            return {
-                "task": input["task"],
-                "answers": final_answers,
-            }
-
-        raise ValueError(f"Unsupported arun mode: {mode}")
-
-
-    def update_memory(self, message: str = None):
-        """Propagate memory update across nodes; supports multi-request keys."""
-        if message is None:
-            for id,node in self.nodes.items():
-                node.update_memory()
+        if self.decision_node:
+            self.connect_decision_node()
+            await self.decision_node.async_execute(input)
+            final_answers = self.decision_node.outputs
+            if len(final_answers) == 0:
+                final_answers.append("No answer of the decision node")
+            metrics_recorder.finalize_request(request_uid)
         else:
-            for id,node in self.nodes.items():
-                node.update_memory_multirequest(message)
+            final_answers = self.nodes[list(self.nodes.keys())[-1]].outputs
+            metrics_recorder.finalize_request(request_uid)
+        return {
+            "task": input.get("task"),
+            "answers": final_answers,
+        }
+
+
+    def update_memory(self):
+        """Propagate memory update across nodes."""
+        for id,node in self.nodes.items():
+            node.update_memory()
 
     def check_cycle(self, new_node, target_nodes):
         """Detect if adding edges would create a cycle starting at `new_node`."""

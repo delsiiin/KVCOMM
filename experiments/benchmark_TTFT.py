@@ -55,15 +55,7 @@ def parse_args():
     parser.add_argument("--llm_name", type=str, default="meta-llama/Llama-3.1-8B-Instruct")
     parser.add_argument("--domain", type=str, default="COPY")
     parser.add_argument("--decision_method", type=str, default=None)
-    parser.add_argument(
-        "--execution_mode",
-        type=str,
-        default="allow_kv_reuse",
-        choices=["default", "allow_kv_reuse"],
-        help="Execution strategy for the graph.",
-    )
     parser.add_argument("--output_dir", type=str, default=str(PROJECT_ROOT / "result" / "TTFT_Benchmark"), help="Directory to save the output results.")
-    parser.add_argument("--prefix", type=str, default="The task is:\n\n", help="The prefix text for the input query, kept the same as the default dense prefill mode.")
     parser.add_argument("--samples", type=int, default=100, help="Number of 1K-token samples")
     parser.add_argument("--kv-threshold", type=float, default=1.0, help="Threshold for key-value memory usage.")
     parser.add_argument("--kv-max-anchor-num", type=int, default=20, help="Maximum number of anchors for key-value memory.")
@@ -88,7 +80,6 @@ async def evaluate(
         *,
         samples: int,
         output_dir: str,
-        **kwargs
         ) -> List[Dict[str, Any]]:
 
     graph.spatial_logits.requires_grad_ = False
@@ -103,7 +94,7 @@ async def evaluate(
         realized_graph = copy.deepcopy(graph)
         realized_graph.spatial_logits = graph.spatial_logits
         realized_graph.temporal_logits = graph.temporal_logits
-        tasks = [asyncio.create_task(realized_graph.arun(input_dict, **kwargs))]
+        tasks = [asyncio.create_task(realized_graph.arun(input_dict))]
         raw_results = await asyncio.gather(*tasks)
         all_results.extend(raw_results)
     print("Done!")
@@ -163,17 +154,11 @@ async def main():
         **kwargs,
     )
 
-    eval_kwargs = {
-        "prefix": args.prefix,
-        "output_dir": str(output_dir),
-    }
-
     configure_logging(log_path=output_dir / "logs/log.txt")
     _ = await evaluate(
         graph=graph,
-        mode=args.execution_mode,
         samples=args.samples,
-        **eval_kwargs,
+        output_dir=str(output_dir),
     )
 
 
