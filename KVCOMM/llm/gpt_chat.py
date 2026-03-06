@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple, Union
 import asyncio
 import copy
-import importlib
 import os
 from time import perf_counter
 import threading
@@ -14,12 +13,13 @@ import async_timeout
 from openai import AsyncOpenAI
 import torch
 from tenacity import retry, stop_after_attempt, wait_random_exponential
-from transformers import AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 from KVCOMM.llm.config import KVCommConfig
 from KVCOMM.llm.format import Message
 from KVCOMM.llm.llm import LLM
 from KVCOMM.llm.llm_registry import LLMRegistry
+from KVCOMM.models.monkeypatch import replace_llama
 from KVCOMM.utils.log import logger
 from KVCOMM.utils.metrics import GenerationResult
 
@@ -30,6 +30,13 @@ def _escape_loguru_markup(text: Optional[str]) -> str:
     if text is None:
         return ""
     return text.replace("<", "\\<")
+
+
+def _total_message_chars(messages: List[Dict[str, str]]) -> int:
+    total = 0
+    for message in messages:
+        total += len(str(message.get("content", "")))
+    return total
 
 
 class _TTFTTracer(StoppingCriteria):
@@ -89,9 +96,9 @@ class GPTChat(LLM):
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
     ) -> GenerationResult:
-        if isinstance(messages, str):
-            messages = [Message(role="user", content=messages)]
-        response_text = await achat(self.model_name, messages)
+        normalised = LLMChat._normalise_messages(messages)
+        input_char_len = _total_message_chars(normalised)
+        response_text = await achat(self.model_name, normalised)
         metadata: Dict[str, Any] = {}
         if request_uid:
             metadata["request_uid"] = request_uid
@@ -101,6 +108,8 @@ class GPTChat(LLM):
             metadata["agent_name"] = agent_name
         if agent_role:
             metadata["agent_role"] = agent_role
+        metadata["input_char_len"] = input_char_len
+        metadata["output_char_len"] = len(response_text) if response_text is not None else 0
         return GenerationResult(text=response_text, mode="default", ttft=0.0, metadata=metadata)
 
     def gen(
@@ -116,16 +125,24 @@ class GPTChat(LLM):
 class LLMChat(LLM):
     """Local HF model chat backend for default execution mode."""
 
-    _LOCAL_CAUSAL_LM_CLASS_MAP: Dict[str, Tuple[str, str]] = {
-        "llama": ("KVCOMM.models.llama.modeling_llama", "LlamaForCausalLM"),
-    }
     _shared_model = None
     _shared_tokenizer = None
+    _shared_compress_mode: Optional[bool] = None
+    _shared_compress_method: Optional[str] = None
     _model_lock = threading.Lock()
 
-    def __init__(self, model_name: str, prefix: str = None, config: KVCommConfig | None = None):
+    def __init__(
+        self,
+        model_name: str,
+        prefix: str = None,
+        config: KVCommConfig | None = None,
+        compress_mode: bool = False,
+        compress_method: str = "rkv",
+    ):
         self.model_name = model_name
         self.config = (config or KVCommConfig.from_env()).validate()
+        self.compress_mode = bool(compress_mode)
+        self.compress_method = (compress_method or "rkv").lower().strip()
         self.lock = asyncio.Lock()
         self._initialize_shared_resources()
         self.tokenizer = LLMChat._shared_tokenizer
@@ -352,13 +369,15 @@ class LLMChat(LLM):
         agent_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
-    ) -> GenerationResult:
+        ) -> GenerationResult:
         async with self.lock:
             if max_tokens is None:
                 max_tokens = self.DEFAULT_MAX_TOKENS
             if temperature is None:
                 temperature = self.DEFAULT_TEMPERATURE
-            inputs, prompt_text, prompt_length = self._build_chat_inputs(messages)
+            normalised_messages = self._normalise_messages(messages)
+            input_char_len = _total_message_chars(normalised_messages)
+            inputs, prompt_text, prompt_length = self._build_chat_inputs(normalised_messages)
             logger.opt(colors=True).debug(
                 "<blue>[PROMPT]</blue> Agent {} Role {} Prompt:\n{}",
                 getattr(self, "node_id", "unknown"),
@@ -402,33 +421,60 @@ class LLMChat(LLM):
                 metadata["agent_role"] = agent_role
             if return_cache:
                 metadata["kv_cache"] = outputs.past_key_values
+            metadata["input_char_len"] = input_char_len
+            metadata["output_char_len"] = len(response_message) if response_message is not None else 0
+            metadata["input_token_len"] = int(prompt_length)
+            metadata["output_token_len"] = int(generated_sequence.shape[-1])
             return GenerationResult(text=response_message, mode="default", ttft=ttft_value, metadata=metadata)
 
-    @classmethod
-    def _resolve_model_class(cls, model_name: str):
-        model_name_lower = model_name.lower()
-        for key, (module_path, class_name) in cls._LOCAL_CAUSAL_LM_CLASS_MAP.items():
-            if key in model_name_lower:
-                module = importlib.import_module(module_path)
-                return getattr(module, class_name)
-        supported = ", ".join(sorted(cls._LOCAL_CAUSAL_LM_CLASS_MAP.keys()))
-        raise ValueError(
-            f"Unsupported local model '{model_name}'. "
-            f"Please add a matching entry under KVCOMM/models. Supported keywords: {supported}."
-        )
+    def _build_compression_config(self) -> Dict[str, Any]:
+        method = self.compress_method
+        supported_methods = {"rkv", "snapkv", "streamingllm", "h2o"}
+        if method not in supported_methods:
+            raise ValueError(
+                f"Unsupported compression method: {self.compress_method}. "
+                f"Supported methods: {sorted(supported_methods)}."
+            )
+        return {
+            "method": method,
+            "method_config": {
+                "budget": 1024,
+                "window_size": 8,
+                "kernel_size": 7,
+                "mix_lambda": 0.07,
+                "retain_ratio": 0.2,
+                "retain_direction": "last",
+                "first_tokens": 4,
+            },
+            "update_kv": True,
+            "compression": None,
+            "compression_content": "all",
+            "divide_method": "step_length",
+            "divide_length": 128,
+        }
 
     def _initialize_shared_resources(self):
         with LLMChat._model_lock:
             if LLMChat._shared_model is None:
-                model_cls = self._resolve_model_class(self.model_name)
+                if self.compress_mode:
+                    if "llama" not in self.model_name.lower():
+                        logger.warning(
+                            "Compression mode is only patched for llama models. "
+                            "Requested model={}, loading without patch.",
+                            self.model_name,
+                        )
+                    else:
+                        replace_llama(self._build_compression_config())
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                LLMChat._shared_model = model_cls.from_pretrained(
+                LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
                     torch_dtype=torch.float16 if "llama" in self.model_name.lower() else torch.float32,
                     low_cpu_mem_usage=True,
                     device_map="cuda:0",
                     trust_remote_code=True,
                 )
+                LLMChat._shared_compress_mode = self.compress_mode
+                LLMChat._shared_compress_method = self.compress_method
                 logger.info("Model {} loaded and shared across instances.", self.model_name)
 
     def __getstate__(self):

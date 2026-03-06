@@ -50,6 +50,8 @@ class Graph(ABC):
                 fixed_temporal_masks:List[List[int]] = None,
                 node_kwargs:List[Dict] = None,
                 kv_config: KVCommConfig | None = None,
+                compress_mode: bool = False,
+                compress_method: str = "rkv",
                 ):
 
         num_agents = len(agent_names)
@@ -66,9 +68,17 @@ class Graph(ABC):
         self.domain:str = domain
         self.llm_name:str = llm_name
         self.agent_names:List[str] = agent_names
+        self.compress_mode = bool(compress_mode)
+        self.compress_method = (compress_method or "rkv").lower().strip()
         self.decision_node:Node = AgentRegistry.get(
             decision_method,
-            **{"domain": self.domain, "llm_name": self.llm_name, "llm_config": self.kv_config},
+            **{
+                "domain": self.domain,
+                "llm_name": self.llm_name,
+                "llm_config": self.kv_config,
+                "compress_mode": self.compress_mode,
+                "compress_method": self.compress_method,
+            },
         ) if decision_method is not None else None
         self.nodes:Dict[str,Node] = {}
         self.potential_spatial_edges:List[List[str, str]] = []
@@ -76,6 +86,8 @@ class Graph(ABC):
         self.node_kwargs = node_kwargs if node_kwargs is not None else [{} for _ in agent_names]
         for kwargs in self.node_kwargs:
             kwargs.setdefault("llm_config", self.kv_config)
+            kwargs.setdefault("compress_mode", self.compress_mode)
+            kwargs.setdefault("compress_method", self.compress_method)
 
         self.init_nodes()                              
         self.init_potential_edges()                                                                   
@@ -275,6 +287,7 @@ class Graph(ABC):
             execution_mode="default",
         )
         for round in range(num_rounds):
+            input["_round_index"] = round
             self.construct_spatial_connection()
             self.construct_temporal_connection(round)
 
@@ -305,6 +318,7 @@ class Graph(ABC):
             self.update_memory()
 
         if self.decision_node:
+            input["_round_index"] = num_rounds
             self.connect_decision_node()
             await self.decision_node.async_execute(input)
             final_answers = self.decision_node.outputs

@@ -17,10 +17,18 @@ class FinalWriteCode(Node):
         domain: str = "",
         llm_name: str = "",
         llm_config: KVCommConfig | None = None,
+        compress_mode: bool = False,
+        compress_method: str = "rkv",
     ):
         super().__init__(id, "FinalWriteCode" ,domain, llm_name)
         prefix = ""
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
+        self.llm = LLMRegistry.get(
+            llm_name,
+            prefix=prefix,
+            llm_config=llm_config,
+            compress_mode=compress_mode,
+            compress_method=compress_method,
+        )
         self.role = 'FinalWriteCode'
         self.llm.set_id(self.id, 'FinalWriteCode')
         self.prompt_set = PromptSetRegistry.get(domain)
@@ -196,10 +204,18 @@ class FinalRefer(Node):
         domain: str = "",
         llm_name: str = "",
         llm_config: KVCommConfig | None = None,
+        compress_mode: bool = False,
+        compress_method: str = "rkv",
     ):
         super().__init__(id, "FinalRefer" ,domain, llm_name)
         prefix = ""
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
+        self.llm = LLMRegistry.get(
+            llm_name,
+            prefix=prefix,
+            llm_config=llm_config,
+            compress_mode=compress_mode,
+            compress_method=compress_method,
+        )
         self.role = 'FinalRefer'
         self.llm.set_id(self.id, 'FinalRefer')
         self.prompt_set = PromptSetRegistry.get(domain)
@@ -313,7 +329,15 @@ class FinalRefer(Node):
 
 @AgentRegistry.register('FinalDirect')
 class FinalDirect(Node):
-    def __init__(self, id: str | None =None,  domain: str = "", llm_name: str = "",):
+    def __init__(
+        self,
+        id: str | None =None,
+        domain: str = "",
+        llm_name: str = "",
+        llm_config: KVCommConfig | None = None,
+        compress_mode: bool = False,
+        compress_method: str = "rkv",
+    ):
         """ Used for Directed IO """
         super().__init__(id, "FinalDirect")
         self.prompt_set = PromptSetRegistry.get(domain)
@@ -348,7 +372,15 @@ class FinalDirect(Node):
 
 @AgentRegistry.register('FinalMajorVote')
 class FinalMajorVote(Node):
-    def __init__(self, id: str | None =None,  domain: str = "", llm_name: str = "",):
+    def __init__(
+        self,
+        id: str | None =None,
+        domain: str = "",
+        llm_name: str = "",
+        llm_config: KVCommConfig | None = None,
+        compress_mode: bool = False,
+        compress_method: str = "rkv",
+    ):
         """ Used for Directed IO """
         super().__init__(id, "FinalMajorVote")
         self.prompt_set = PromptSetRegistry.get(domain)

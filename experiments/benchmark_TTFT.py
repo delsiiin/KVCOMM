@@ -28,6 +28,13 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 
+def build_compression_tag(compress_mode: bool, compress_method: str) -> str:
+    if not compress_mode:
+        return "no-compress"
+    safe_method = (compress_method or "unknown").strip().replace("/", "-").replace(" ", "-")
+    return f"compress-{safe_method}"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="KVCOMM Experiments on TTFT Benchmark")
     parser.add_argument(
@@ -62,6 +69,8 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=5, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--compress-mode", action="store_true", help="Enable LLM KV compression patch.")
+    parser.add_argument("--compress-method", type=str, default="rkv", help="Compression method: rkv/snapkv/streamingllm/h2o.")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
@@ -80,6 +89,7 @@ async def evaluate(
         *,
         samples: int,
         output_dir: str,
+        compression_tag: str,
         ) -> List[Dict[str, Any]]:
 
     graph.spatial_logits.requires_grad_ = False
@@ -100,14 +110,14 @@ async def evaluate(
     print("Done!")
 
     try:
-        _write_per_agent_latency(output_dir)
+        _write_per_agent_latency(output_dir, compression_tag)
     except Exception as e:
         logger.warning("Failed to write per-agent latency JSONs: {}", e)
 
     return all_results
 
 
-def _write_per_agent_latency(output_dir: str) -> None:
+def _write_per_agent_latency(output_dir: str, compression_tag: str) -> None:
     latency_path = Path(output_dir) / "Latency.json"
     if not latency_path.exists():
         logger.warning("Latency.json not found at {}", str(latency_path))
@@ -118,17 +128,20 @@ def _write_per_agent_latency(output_dir: str) -> None:
     except Exception as e:
         logger.warning("Could not read Latency.json: {}", e)
         return
+    tagged_latency_path = Path(output_dir) / f"Latency_{compression_tag}.json"
+    with open(tagged_latency_path, "w", encoding="utf-8") as f:
+        json.dump(records, f, ensure_ascii=False, indent=2)
     by_agent: Dict[str, List[Dict[str, Any]]] = {}
     for rec in records if isinstance(records, list) else []:
         agent_id = rec.get("agent_id") or "unknown"
         by_agent.setdefault(agent_id, []).append(rec)
-    out_dir = Path(output_dir) / "agent_latency"
+    out_dir = Path(output_dir) / f"agent_latency_{compression_tag}"
     out_dir.mkdir(parents=True, exist_ok=True)
     for agent_id, items in by_agent.items():
-        agent_file = out_dir / f"agent_{agent_id}.json"
+        agent_file = out_dir / f"agent_{agent_id}_{compression_tag}.json"
         with open(agent_file, "w", encoding="utf-8") as f:
             json.dump(items, f, ensure_ascii=False, indent=2)
-    combined = out_dir / "PerAgentLatency.json"
+    combined = out_dir / f"PerAgentLatency_{compression_tag}.json"
     with open(combined, "w", encoding="utf-8") as f:
         json.dump(by_agent, f, ensure_ascii=False, indent=2)
 
@@ -136,6 +149,7 @@ async def main():
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    compression_tag = build_compression_tag(args.compress_mode, args.compress_method)
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
     kv_config = KVCommConfig.from_env().apply_overrides(
@@ -151,14 +165,17 @@ async def main():
         llm_name=args.llm_name,
         agent_names=agent_names,
         kv_config=kv_config,
+        compress_mode=args.compress_mode,
+        compress_method=args.compress_method,
         **kwargs,
     )
 
-    configure_logging(log_path=output_dir / "logs/log.txt")
+    configure_logging(log_path=output_dir / "logs" / f"log_{compression_tag}.txt")
     _ = await evaluate(
         graph=graph,
         samples=args.samples,
         output_dir=str(output_dir),
+        compression_tag=compression_tag,
     )
 
 

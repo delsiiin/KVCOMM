@@ -18,6 +18,7 @@ from datasets.MMLU.download import download
 from datasets.mmlu_dataset import MMLUDataset
 from experiments.evaluate_mmlu import evaluate
 from KVCOMM.utils.log import configure_logging, logger
+from KVCOMM.utils.metrics import metrics_recorder
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
@@ -26,6 +27,13 @@ random.seed(SEED)
 np.random.seed(SEED)
 torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
+
+
+def build_compression_tag(compress_mode: bool, compress_method: str) -> str:
+    if not compress_mode:
+        return "no-compress"
+    safe_method = (compress_method or "unknown").strip().replace("/", "-").replace(" ", "-")
+    return f"compress-{safe_method}"
 
 
 def parse_args():
@@ -58,6 +66,9 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--compress-mode", action="store_true", help="Enable LLM KV compression patch.")
+    parser.add_argument("--compress-method", type=str, default="rkv", help="Compression method: rkv/snapkv/streamingllm/h2o.")
+    parser.add_argument("--plot-length-hist", dest="plot_length_hist", action="store_true", default=False, help="Plot per-agent input/output length histograms.")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
@@ -71,6 +82,9 @@ async def main():
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
+    compression_tag = build_compression_tag(args.compress_mode, args.compress_method)
+    safe_llm_name = args.llm_name.replace("/", "-")
+    metrics_recorder.reset()
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
     kv_config = KVCommConfig.from_env().apply_overrides(
@@ -87,13 +101,15 @@ async def main():
         agent_names=agent_names,
         decision_method=args.decision_method,
         kv_config=kv_config,
+        compress_mode=args.compress_mode,
+        compress_method=args.compress_method,
         **kwargs,
     )
 
     download()
     dataset_val = MMLUDataset("val")
     limit_questions = 153
-    configure_logging(log_path=output_dir / "logs/log.txt")
+    configure_logging(log_path=output_dir / "logs" / f"log_{compression_tag}.txt")
     timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     score = await evaluate(
         graph=graph,
@@ -101,15 +117,21 @@ async def main():
         limit_questions=limit_questions,
         eval_batch_size=args.batch_size,
     )
+    run_tag = f"{args.domain}_{safe_llm_name}_{compression_tag}_{timestamp}"
+    length_artifacts = metrics_recorder.export_agent_length_artifacts(
+        output_dir=output_dir / "length_stats",
+        run_tag=run_tag,
+        plot_hist=args.plot_length_hist,
+    )
     logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
-    safe_llm_name = args.llm_name.replace("/", "-")
-    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{timestamp}.json"
+    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{compression_tag}_{timestamp}.json"
     result_file.touch(exist_ok=True)
     payload = {
         "score": score,
         "agent_names": args.agent_names,
         "agent_nums": args.agent_nums,
         "timestamp": timestamp,
+        "length_artifacts": length_artifacts,
     }
     with open(result_file, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)

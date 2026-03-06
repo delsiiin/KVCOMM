@@ -33,6 +33,13 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 
+def build_compression_tag(compress_mode: bool, compress_method: str) -> str:
+    if not compress_mode:
+        return "no-compress"
+    safe_method = (compress_method or "unknown").strip().replace("/", "-").replace(" ", "-")
+    return f"compress-{safe_method}"
+
+
 def load_result(result_file: Path) -> list:
     if not result_file.exists():
         os.makedirs(result_file.parent, exist_ok=True)
@@ -84,6 +91,9 @@ def parse_args():
     parser.add_argument("--kv-window-size", type=int, default=None, help="Window size for key-value memory update.")
     parser.add_argument("--kv-thread-workers", type=int, default=None, help="Number of thread workers for key-value memory processing.")
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
+    parser.add_argument("--compress-mode", action="store_true", help="Enable LLM KV compression patch.")
+    parser.add_argument("--compress-method", type=str, default="rkv", help="Compression method: rkv/snapkv/streamingllm/h2o.")
+    parser.add_argument("--plot-length-hist", dest="plot_length_hist", action="store_true", default=False, help="Plot per-agent input/output length histograms.")
     args = parser.parse_args()
 
     if len(args.agent_names) != len(args.agent_nums):
@@ -95,14 +105,17 @@ async def main():
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    configure_logging(log_path=output_dir / "logs/log.txt")
+    compression_tag = build_compression_tag(args.compress_mode, args.compress_method)
+    configure_logging(log_path=output_dir / "logs" / f"log_{compression_tag}.txt")
+    metrics_recorder.reset()
     dataset_raw = JSONLReader.parse_file(args.dataset_json)
     dataset = gsm_data_process(dataset_raw)
 
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
     safe_llm_name = args.llm_name.replace("/", "-")
-    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{current_time}.json"
+    run_tag = f"{args.domain}_{safe_llm_name}_{compression_tag}_{current_time}"
+    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{compression_tag}_{current_time}.json"
 
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
@@ -121,6 +134,8 @@ async def main():
         agent_names=agent_names,
         decision_method=args.decision_method,
         kv_config=kv_config,
+        compress_mode=args.compress_mode,
+        compress_method=args.compress_method,
         **kwargs,
     )
 
@@ -205,6 +220,12 @@ async def main():
         )
         logger.opt(colors=True).info(f"<blue>[ACCURACY]</blue> {accuracy:.4f}")
         metrics_recorder.log_cumulative(batch_index=i_batch)
+
+    metrics_recorder.export_agent_length_artifacts(
+        output_dir=output_dir / "length_stats",
+        run_tag=run_tag,
+        plot_hist=args.plot_length_hist,
+    )
 
 
 def get_kwargs(

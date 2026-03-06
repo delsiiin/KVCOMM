@@ -163,6 +163,7 @@ class Node(ABC):
         self.outputs = []
         spatial_info:Dict[str,Any] = self.get_spatial_info()
         temporal_info:Dict[str,Any] = self.get_temporal_info()
+        round_index = input.get("_round_index") if isinstance(input, dict) else None
         tasks = [
             asyncio.create_task(
                 self._async_execute(input, spatial_info, temporal_info, **kwargs)
@@ -190,6 +191,7 @@ class Node(ABC):
                         agent_name=self.agent_name,
                         agent_role=self.role,
                         generation=generation,
+                        round_index=round_index,
                     )
         return self.outputs
 

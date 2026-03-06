@@ -18,10 +18,18 @@ class CodeWriting(Node):
         domain: str = "",
         llm_name: str = "",
         llm_config: KVCommConfig | None = None,
+        compress_mode: bool = False,
+        compress_method: str = "rkv",
     ):
         super().__init__(id, "CodeWriting" ,domain, llm_name)
         prefix = ""
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
+        self.llm = LLMRegistry.get(
+            llm_name,
+            prefix=prefix,
+            llm_config=llm_config,
+            compress_mode=compress_mode,
+            compress_method=compress_method,
+        )
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
         self.constraint = self.prompt_set.get_constraint(self.role) 
@@ -109,6 +117,10 @@ class CodeWriting(Node):
                 text=user_prompt,
                 mode="default",
                 ttft=0.0,
+                metadata={
+                    "input_char_len": len(system_prompt) + len(user_prompt),
+                    "output_char_len": len(user_prompt),
+                },
             )
         message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
         result = await self.llm.agen(

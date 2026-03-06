@@ -25,11 +25,19 @@ class AnalyzeAgent(Node):
         domain: str = "",
         llm_name: str = "",
         llm_config: KVCommConfig | None = None,
+        compress_mode: bool = False,
+        compress_method: str = "rkv",
     ):
         super().__init__(id, "AnalyzeAgent" ,domain, llm_name)
         prefix = ""
 
-        self.llm = LLMRegistry.get(llm_name, prefix=prefix, llm_config=llm_config)
+        self.llm = LLMRegistry.get(
+            llm_name,
+            prefix=prefix,
+            llm_config=llm_config,
+            compress_mode=compress_mode,
+            compress_method=compress_method,
+        )
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
         self.llm.set_id(self.id, self.role)
