@@ -101,7 +101,8 @@ async def main():
 
     current_time = Time.instance().value or time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
     Time.instance().value = current_time
-    result_file = output_dir / f"{args.domain}_{args.llm_name}_{current_time}.json"
+    safe_llm_name = args.llm_name.replace("/", "-")
+    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{current_time}.json"
 
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))

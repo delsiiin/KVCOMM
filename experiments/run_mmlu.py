@@ -102,7 +102,8 @@ async def main():
         eval_batch_size=args.batch_size,
     )
     logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
-    result_file = output_dir / f"{args.domain}_{args.llm_name}_{timestamp}.json"
+    safe_llm_name = args.llm_name.replace("/", "-")
+    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{timestamp}.json"
     result_file.touch(exist_ok=True)
     payload = {
         "score": score,

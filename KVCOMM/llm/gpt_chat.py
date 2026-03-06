@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any, Dict, List, Optional, Tuple, Union
 import asyncio
 import copy
+import importlib
 import os
 from time import perf_counter
 import threading
@@ -13,7 +14,7 @@ import async_timeout
 from openai import AsyncOpenAI
 import torch
 from tenacity import retry, stop_after_attempt, wait_random_exponential
-from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
+from transformers import AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 from KVCOMM.llm.config import KVCommConfig
 from KVCOMM.llm.format import Message
@@ -115,6 +116,9 @@ class GPTChat(LLM):
 class LLMChat(LLM):
     """Local HF model chat backend for default execution mode."""
 
+    _LOCAL_CAUSAL_LM_CLASS_MAP: Dict[str, Tuple[str, str]] = {
+        "llama": ("KVCOMM.models.llama.modeling_llama", "LlamaForCausalLM"),
+    }
     _shared_model = None
     _shared_tokenizer = None
     _model_lock = threading.Lock()
@@ -400,11 +404,25 @@ class LLMChat(LLM):
                 metadata["kv_cache"] = outputs.past_key_values
             return GenerationResult(text=response_message, mode="default", ttft=ttft_value, metadata=metadata)
 
+    @classmethod
+    def _resolve_model_class(cls, model_name: str):
+        model_name_lower = model_name.lower()
+        for key, (module_path, class_name) in cls._LOCAL_CAUSAL_LM_CLASS_MAP.items():
+            if key in model_name_lower:
+                module = importlib.import_module(module_path)
+                return getattr(module, class_name)
+        supported = ", ".join(sorted(cls._LOCAL_CAUSAL_LM_CLASS_MAP.keys()))
+        raise ValueError(
+            f"Unsupported local model '{model_name}'. "
+            f"Please add a matching entry under KVCOMM/models. Supported keywords: {supported}."
+        )
+
     def _initialize_shared_resources(self):
         with LLMChat._model_lock:
             if LLMChat._shared_model is None:
+                model_cls = self._resolve_model_class(self.model_name)
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
+                LLMChat._shared_model = model_cls.from_pretrained(
                     self.model_name,
                     torch_dtype=torch.float16 if "llama" in self.model_name.lower() else torch.float32,
                     low_cpu_mem_usage=True,
