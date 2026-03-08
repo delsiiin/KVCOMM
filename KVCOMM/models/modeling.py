@@ -107,6 +107,11 @@ def LlamaAttention_forward(
     cache_position: Optional[torch.LongTensor] = None,
     **kwargs: Unpack[FlashAttentionKwargs],
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    kvcomm_should_compress = kwargs.pop("kvcomm_should_compress", None)
+    kvcomm_state_key = kwargs.pop("kvcomm_state_key", None)
+    if kvcomm_should_compress is None:
+        kvcomm_should_compress = self.config.compression
+
     input_shape = hidden_states.shape[:-1]
     hidden_shape = (*input_shape, -1, self.head_dim)
 
@@ -149,11 +154,12 @@ def LlamaAttention_forward(
 
         # =============== decoding-time compression start ===============
         cached_queries = past_key_value.query_cache[self.layer_idx]
-        if self.config.compression is None:
+        if kvcomm_should_compress is None:
             key_states_compress, value_states_compress = self.kv_cluster.update_kv(
                 key_states,
                 cached_queries,  # Use cached queries instead of current query
                 value_states,
+                state_key=kvcomm_state_key,
             )
 
             if self.config.update_kv is True:
@@ -171,7 +177,7 @@ def LlamaAttention_forward(
                     cache_kwargs,
                 )
 
-        elif self.config.compression is True:
+        elif kvcomm_should_compress is True:
             key_states, value_states = past_key_value.update(
                 key_states,
                 value_states,
@@ -183,6 +189,7 @@ def LlamaAttention_forward(
                 key_states,
                 cached_queries,  # Use cached queries instead of current query
                 value_states,
+                state_key=kvcomm_state_key,
             )
 
             if self.config.update_kv is True:
@@ -239,6 +246,9 @@ def CausalLM_forward(
     logits_to_keep: Union[int, torch.Tensor] = 0,
     **kwargs,
 ) -> Union[Tuple, CausalLMOutputWithPast]:
+    kvcomm_state_key = kwargs.pop("kvcomm_state_key", None)
+    kwargs.pop("kvcomm_should_compress", None)
+
     output_attentions = (
         output_attentions
         if output_attentions is not None
@@ -253,15 +263,41 @@ def CausalLM_forward(
         return_dict if return_dict is not None else self.config.use_return_dict
     )
 
-    # sample-level statistics
-    if len(past_key_values) == 0:
-        if self.config.compression_content == "think":
-            self.after_think = False
+    if not hasattr(self, "_kvcomm_seq_states"):
+        self._kvcomm_seq_states = {}
+    state_key = kvcomm_state_key or "__default__"
+    if state_key not in self._kvcomm_seq_states:
+        self._kvcomm_seq_states[state_key] = {
+            "length": 0,
+            "after_think": False,
+            "next_compression": None,
+        }
+    seq_state = self._kvcomm_seq_states[state_key]
 
-    if not hasattr(self, "length"):
-        self.length = input_ids.shape[1]
+    input_len = 0
+    if input_ids is not None:
+        input_len = input_ids.shape[1]
+    elif inputs_embeds is not None:
+        input_len = inputs_embeds.shape[1]
+
+    is_prefill = False
+    if past_key_values is None:
+        is_prefill = True
     else:
-        self.length += input_ids.shape[1]
+        try:
+            is_prefill = len(past_key_values) == 0
+        except TypeError:
+            is_prefill = False
+
+    if is_prefill:
+        seq_state["length"] = input_len
+        if self.config.compression_content == "think":
+            seq_state["after_think"] = False
+        seq_state["next_compression"] = None
+    else:
+        seq_state["length"] += input_len
+
+    kvcomm_should_compress = seq_state.get("next_compression", None)
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
@@ -275,6 +311,8 @@ def CausalLM_forward(
         output_hidden_states=output_hidden_states,
         return_dict=return_dict,
         cache_position=cache_position,
+        kvcomm_state_key=state_key,
+        kvcomm_should_compress=kvcomm_should_compress,
         **kwargs,
     )
 
@@ -291,24 +329,22 @@ def CausalLM_forward(
     # assume non-batch input, shape: [1, logits_to_keep, vocab_size]
     predicted_token_ids = logits[:, -1, :].argmax(dim=-1)
 
-    if self.config.compression_content == "think" and self.after_think == False:
-        self.after_think = (
+    if self.config.compression_content == "think" and seq_state["after_think"] is False:
+        seq_state["after_think"] = (
             predicted_token_ids[0].cpu().item() in self.after_think_token_ids
         )
 
     if self.config.divide_method == "newline":
         is_newline = predicted_token_ids[0].cpu().item() in self.newline_token_ids
     elif self.config.divide_method == "step_length":
-        is_newline = self.length % self.config.divide_length == 0
+        is_newline = seq_state["length"] % self.config.divide_length == 0
     else:
         raise ValueError(f"Invalid divide_method: {self.config.divide_method}")
 
-    if self.config.compression_content == "think" and self.after_think == True:
+    if self.config.compression_content == "think" and seq_state["after_think"] is True:
         is_newline = False
 
-    # Set compression flag for all layers at once
-    for layer in self.model.layers:
-        layer.self_attn.config.compression = is_newline
+    seq_state["next_compression"] = is_newline
     # =============== Step-level Compression logic end =================
 
     loss = None

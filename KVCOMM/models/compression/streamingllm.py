@@ -17,7 +17,9 @@ class StreamingLLM:
         key_states,
         query_states,
         value_states,
+        state_key=None,
     ):
+        _ = state_key
         kv_cache_len = key_states.shape[-2]
 
         if kv_cache_len < self.budget:

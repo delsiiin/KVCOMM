@@ -149,6 +149,7 @@ class LLMChat(LLM):
         self.compress_method = (compress_method or "rkv").lower().strip()
         self.compress_budget = int(compress_budget)
         self.compress_divide_length = int(compress_divide_length)
+        self._kvcomm_call_seq = 0
         self.lock = asyncio.Lock()
         self._initialize_shared_resources()
         self.tokenizer = LLMChat._shared_tokenizer
@@ -340,6 +341,28 @@ class LLMChat(LLM):
         self.node_id = node_id
         self.role = role
 
+    def _next_kvcomm_call_seq(self) -> int:
+        seq = getattr(self, "_kvcomm_call_seq", 0)
+        self._kvcomm_call_seq = seq + 1
+        return seq
+
+    def _build_kvcomm_state_key(
+        self,
+        request_uid: Optional[str] = None,
+        agent_id: Optional[str] = None,
+    ) -> str:
+        seq = self._next_kvcomm_call_seq()
+        req = request_uid or "sync"
+        agent = agent_id or getattr(self, "node_id", "unknown")
+        return f"{req}:{agent}:{seq}"
+
+    def _cleanup_kvcomm_state(self, state_key: str) -> None:
+        if not state_key:
+            return
+        seq_states = getattr(self.model, "_kvcomm_seq_states", None)
+        if isinstance(seq_states, dict):
+            seq_states.pop(state_key, None)
+
     def gen(
         self,
         messages: List[Message],
@@ -351,15 +374,20 @@ class LLMChat(LLM):
         if temperature is None:
             temperature = self.DEFAULT_TEMPERATURE
         inputs, _, prompt_length = self._build_chat_inputs(messages)
-        outputs = self.model.generate(
-            **inputs,
-            do_sample=False,
-            temperature=temperature,
-            max_new_tokens=max_tokens,
-            return_dict_in_generate=True,
-            return_legacy_cache=False,
-            use_cache=True,
-        )
+        kvcomm_state_key = self._build_kvcomm_state_key()
+        try:
+            outputs = self.model.generate(
+                **inputs,
+                do_sample=False,
+                temperature=temperature,
+                max_new_tokens=max_tokens,
+                return_dict_in_generate=True,
+                return_legacy_cache=False,
+                use_cache=True,
+                kvcomm_state_key=kvcomm_state_key,
+            )
+        finally:
+            self._cleanup_kvcomm_state(kvcomm_state_key)
         generated_sequence = outputs.sequences[:, prompt_length:]
         return self.tokenizer.decode(generated_sequence[0], skip_special_tokens=True).strip()
 
@@ -398,10 +426,17 @@ class LLMChat(LLM):
                 "return_legacy_cache": False,
                 "use_cache": True,
             }
+            kvcomm_state_key = self._build_kvcomm_state_key(
+                request_uid=request_uid, agent_id=agent_id
+            )
+            generation_kwargs["kvcomm_state_key"] = kvcomm_state_key
             ttft_tracer = _TTFTTracer(prompt_length)
             generation_kwargs["stopping_criteria"] = StoppingCriteriaList([ttft_tracer])
             ttft_tracer.reset(prompt_length)
-            outputs = self.model.generate(**inputs, **generation_kwargs)
+            try:
+                outputs = self.model.generate(**inputs, **generation_kwargs)
+            finally:
+                self._cleanup_kvcomm_state(kvcomm_state_key)
             if ttft_tracer.ttft is None:
                 if torch.cuda.is_available():
                     torch.cuda.synchronize()
@@ -500,6 +535,8 @@ class LLMChat(LLM):
 
     def __setstate__(self, state):
         self.__dict__.update(state)
+        if not hasattr(self, "_kvcomm_call_seq"):
+            self._kvcomm_call_seq = 0
         self.tokenizer = LLMChat._shared_tokenizer
         self.model = LLMChat._shared_model
         self.lock = asyncio.Lock()
