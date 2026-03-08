@@ -19,6 +19,8 @@ class FinalWriteCode(Node):
         llm_config: KVCommConfig | None = None,
         compress_mode: bool = False,
         compress_method: str = "rkv",
+        compress_budget: int = 1024,
+        compress_divide_length: int = 128,
     ):
         super().__init__(id, "FinalWriteCode" ,domain, llm_name)
         prefix = ""
@@ -28,6 +30,8 @@ class FinalWriteCode(Node):
             llm_config=llm_config,
             compress_mode=compress_mode,
             compress_method=compress_method,
+            compress_budget=compress_budget,
+            compress_divide_length=compress_divide_length,
         )
         self.role = 'FinalWriteCode'
         self.llm.set_id(self.id, 'FinalWriteCode')
@@ -206,6 +210,8 @@ class FinalRefer(Node):
         llm_config: KVCommConfig | None = None,
         compress_mode: bool = False,
         compress_method: str = "rkv",
+        compress_budget: int = 1024,
+        compress_divide_length: int = 128,
     ):
         super().__init__(id, "FinalRefer" ,domain, llm_name)
         prefix = ""
@@ -215,6 +221,8 @@ class FinalRefer(Node):
             llm_config=llm_config,
             compress_mode=compress_mode,
             compress_method=compress_method,
+            compress_budget=compress_budget,
+            compress_divide_length=compress_divide_length,
         )
         self.role = 'FinalRefer'
         self.llm.set_id(self.id, 'FinalRefer')
@@ -337,6 +345,8 @@ class FinalDirect(Node):
         llm_config: KVCommConfig | None = None,
         compress_mode: bool = False,
         compress_method: str = "rkv",
+        compress_budget: int = 1024,
+        compress_divide_length: int = 128,
     ):
         """ Used for Directed IO """
         super().__init__(id, "FinalDirect")
@@ -380,6 +390,8 @@ class FinalMajorVote(Node):
         llm_config: KVCommConfig | None = None,
         compress_mode: bool = False,
         compress_method: str = "rkv",
+        compress_budget: int = 1024,
+        compress_divide_length: int = 128,
     ):
         """ Used for Directed IO """
         super().__init__(id, "FinalMajorVote")

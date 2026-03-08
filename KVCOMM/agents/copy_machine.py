@@ -18,6 +18,8 @@ class CopyMachine(Node):
         llm_config: KVCommConfig | None = None,
         compress_mode: bool = False,
         compress_method: str = "rkv",
+        compress_budget: int = 1024,
+        compress_divide_length: int = 128,
     ):
         super().__init__(id, "CopyMachine" ,domain, llm_name)
         prefix = ""
@@ -28,6 +30,8 @@ class CopyMachine(Node):
             llm_config=llm_config,
             compress_mode=compress_mode,
             compress_method=compress_method,
+            compress_budget=compress_budget,
+            compress_divide_length=compress_divide_length,
         )
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role

@@ -129,6 +129,8 @@ class LLMChat(LLM):
     _shared_tokenizer = None
     _shared_compress_mode: Optional[bool] = None
     _shared_compress_method: Optional[str] = None
+    _shared_compress_budget: Optional[int] = None
+    _shared_compress_divide_length: Optional[int] = None
     _model_lock = threading.Lock()
 
     def __init__(
@@ -138,11 +140,15 @@ class LLMChat(LLM):
         config: KVCommConfig | None = None,
         compress_mode: bool = False,
         compress_method: str = "rkv",
+        compress_budget: int = 1024,
+        compress_divide_length: int = 128,
     ):
         self.model_name = model_name
         self.config = (config or KVCommConfig.from_env()).validate()
         self.compress_mode = bool(compress_mode)
         self.compress_method = (compress_method or "rkv").lower().strip()
+        self.compress_budget = int(compress_budget)
+        self.compress_divide_length = int(compress_divide_length)
         self.lock = asyncio.Lock()
         self._initialize_shared_resources()
         self.tokenizer = LLMChat._shared_tokenizer
@@ -435,10 +441,16 @@ class LLMChat(LLM):
                 f"Unsupported compression method: {self.compress_method}. "
                 f"Supported methods: {sorted(supported_methods)}."
             )
+        if self.compress_budget <= 0:
+            raise ValueError(f"compress_budget must be > 0, got {self.compress_budget}.")
+        if self.compress_divide_length <= 0:
+            raise ValueError(
+                f"compress_divide_length must be > 0, got {self.compress_divide_length}."
+            )
         return {
             "method": method,
             "method_config": {
-                "budget": 1024,
+                "budget": self.compress_budget,
                 "window_size": 8,
                 "kernel_size": 7,
                 "mix_lambda": 0.07,
@@ -450,7 +462,7 @@ class LLMChat(LLM):
             "compression": None,
             "compression_content": "all",
             "divide_method": "step_length",
-            "divide_length": 128,
+            "divide_length": self.compress_divide_length,
         }
 
     def _initialize_shared_resources(self):
@@ -468,13 +480,15 @@ class LLMChat(LLM):
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
                 LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=torch.float16 if "llama" in self.model_name.lower() else torch.float32,
+                    torch_dtype=torch.float16,
                     low_cpu_mem_usage=True,
                     device_map="cuda:0",
                     trust_remote_code=True,
                 )
                 LLMChat._shared_compress_mode = self.compress_mode
                 LLMChat._shared_compress_method = self.compress_method
+                LLMChat._shared_compress_budget = self.compress_budget
+                LLMChat._shared_compress_divide_length = self.compress_divide_length
                 logger.info("Model {} loaded and shared across instances.", self.model_name)
 
     def __getstate__(self):

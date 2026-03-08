@@ -52,6 +52,8 @@ class Graph(ABC):
                 kv_config: KVCommConfig | None = None,
                 compress_mode: bool = False,
                 compress_method: str = "rkv",
+                compress_budget: int = 1024,
+                compress_divide_length: int = 128,
                 ):
 
         num_agents = len(agent_names)
@@ -70,6 +72,8 @@ class Graph(ABC):
         self.agent_names:List[str] = agent_names
         self.compress_mode = bool(compress_mode)
         self.compress_method = (compress_method or "rkv").lower().strip()
+        self.compress_budget = int(compress_budget)
+        self.compress_divide_length = int(compress_divide_length)
         self.decision_node:Node = AgentRegistry.get(
             decision_method,
             **{
@@ -78,6 +82,8 @@ class Graph(ABC):
                 "llm_config": self.kv_config,
                 "compress_mode": self.compress_mode,
                 "compress_method": self.compress_method,
+                "compress_budget": self.compress_budget,
+                "compress_divide_length": self.compress_divide_length,
             },
         ) if decision_method is not None else None
         self.nodes:Dict[str,Node] = {}
@@ -88,6 +94,8 @@ class Graph(ABC):
             kwargs.setdefault("llm_config", self.kv_config)
             kwargs.setdefault("compress_mode", self.compress_mode)
             kwargs.setdefault("compress_method", self.compress_method)
+            kwargs.setdefault("compress_budget", self.compress_budget)
+            kwargs.setdefault("compress_divide_length", self.compress_divide_length)
 
         self.init_nodes()                              
         self.init_potential_edges()                                                                   

@@ -30,11 +30,11 @@ torch.manual_seed(SEED)
 torch.cuda.manual_seed_all(SEED)
 
 
-def build_compression_tag(compress_mode: bool, compress_method: str) -> str:
+def build_compression_tag(compress_mode: bool, compress_method: str, compress_budget: int) -> str:
     if not compress_mode:
         return "no-compress"
     safe_method = (compress_method or "unknown").strip().replace("/", "-").replace(" ", "-")
-    return f"compress-{safe_method}"
+    return f"compress-{safe_method}-b{int(compress_budget)}"
 
 
 def load_result(result_file: Path) -> list:
@@ -85,6 +85,8 @@ def parse_args():
     parser.add_argument("--kv-worker-timeout", type=float, default=None, help="Timeout for key-value memory workers processing.")
     parser.add_argument("--compress-mode", action="store_true", help="Enable LLM KV compression patch.")
     parser.add_argument("--compress-method", type=str, default="rkv", help="Compression method: rkv/snapkv/streamingllm/h2o.")
+    parser.add_argument("--compress-budget", type=int, default=1024, help="Compression KV budget.")
+    parser.add_argument("--compress-divide-length", type=int, default=128, help="Compression divide length.")
     parser.add_argument("--plot-length-hist", dest="plot_length_hist", action="store_true", default=False, help="Plot per-agent input/output length histograms.")
     
     args = parser.parse_args()
@@ -97,7 +99,7 @@ async def main():
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    compression_tag = build_compression_tag(args.compress_mode, args.compress_method)
+    compression_tag = build_compression_tag(args.compress_mode, args.compress_method, args.compress_budget)
     configure_logging(log_path=output_dir / "logs" / f"log_{compression_tag}.txt")
     metrics_recorder.reset()
     dataset = JSONLReader.parse_file(args.dataset_json)
@@ -127,6 +129,8 @@ async def main():
         kv_config=kv_config,
         compress_mode=args.compress_mode,
         compress_method=args.compress_method,
+        compress_budget=args.compress_budget,
+        compress_divide_length=args.compress_divide_length,
         **kwargs,
     )
 
