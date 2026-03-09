@@ -19,7 +19,7 @@ from KVCOMM.llm.config import KVCommConfig
 from KVCOMM.llm.format import Message
 from KVCOMM.llm.llm import LLM
 from KVCOMM.llm.llm_registry import LLMRegistry
-from KVCOMM.models.monkeypatch import replace_llama
+from KVCOMM.models.monkeypatch import replace_llama, replace_qwen2
 from KVCOMM.utils.log import logger
 from KVCOMM.utils.metrics import GenerationResult
 
@@ -504,14 +504,17 @@ class LLMChat(LLM):
         with LLMChat._model_lock:
             if LLMChat._shared_model is None:
                 if self.compress_mode:
-                    if "llama" not in self.model_name.lower():
+                    model_name_lower = self.model_name.lower()
+                    if "llama" in model_name_lower:
+                        replace_llama(self._build_compression_config())
+                    elif "qwen" in model_name_lower:
+                        replace_qwen2(self._build_compression_config())
+                    else:
                         logger.warning(
-                            "Compression mode is only patched for llama models. "
+                            "Compression mode is only patched for llama/qwen models. "
                             "Requested model={}, loading without patch.",
                             self.model_name,
                         )
-                    else:
-                        replace_llama(self._build_compression_config())
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
                 LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,

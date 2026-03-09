@@ -10,6 +10,8 @@ from transformers.models.llama.modeling_llama import (
 
 from transformers.models.llama.configuration_llama import LlamaConfig
 from transformers.models.llama.modeling_llama import LlamaRotaryEmbedding
+from transformers.models.qwen2.configuration_qwen2 import Qwen2Config
+from transformers.models.qwen2.modeling_qwen2 import Qwen2RotaryEmbedding
 from transformers.cache_utils import Cache
 from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 from transformers.modeling_flash_attention_utils import _flash_attention_forward
@@ -229,6 +231,186 @@ def LlamaAttention_forward(
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
+def Qwen2Attention_init(
+    self, config: Qwen2Config, layer_idx: int, compression_config: dict
+):
+    nn.Module.__init__(self)
+    self.config = config
+    self.layer_idx = layer_idx
+    self.hidden_size = config.hidden_size
+    self.num_heads = config.num_attention_heads
+    self.head_dim = getattr(
+        config, "head_dim", config.hidden_size // config.num_attention_heads
+    )
+    self.num_key_value_groups = config.num_attention_heads // config.num_key_value_heads
+    self.num_key_value_heads = config.num_key_value_heads
+    self.scaling = self.head_dim**-0.5
+    self.max_position_embeddings = config.max_position_embeddings
+    self.rope_theta = config.rope_theta
+    self.attention_dropout = config.attention_dropout
+    self.is_causal = True
+    self.rotary_emb = Qwen2RotaryEmbedding(config=self.config)
+    self.q_proj = nn.Linear(
+        config.hidden_size, config.num_attention_heads * self.head_dim, bias=True
+    )
+    self.k_proj = nn.Linear(
+        config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True
+    )
+    self.v_proj = nn.Linear(
+        config.hidden_size, config.num_key_value_heads * self.head_dim, bias=True
+    )
+    self.o_proj = nn.Linear(
+        config.num_attention_heads * self.head_dim, config.hidden_size, bias=False
+    )
+
+    # =============== New logic start ===============
+    self.config.update(compression_config)
+    self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
+        layer_idx=self.layer_idx, model_config=self.config, model_type="qwen2", **compression_config["method_config"] 
+    )
+    # =============== New logic end =================
+
+
+def Qwen2Attention_forward(
+    self,
+    hidden_states: torch.Tensor,
+    position_embeddings: Tuple[torch.Tensor, torch.Tensor],
+    attention_mask: Optional[torch.Tensor],
+    past_key_value: Optional[Cache] = None,
+    cache_position: Optional[torch.LongTensor] = None,
+    **kwargs: Unpack[FlashAttentionKwargs],
+) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
+    kvcomm_should_compress = kwargs.pop("kvcomm_should_compress", None)
+    kvcomm_state_key = kwargs.pop("kvcomm_state_key", None)
+    if kvcomm_should_compress is None:
+        kvcomm_should_compress = self.config.compression
+
+    input_shape = hidden_states.shape[:-1]
+    hidden_shape = (*input_shape, -1, self.head_dim)
+
+    query_states = self.q_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    key_states = self.k_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+    value_states = self.v_proj(hidden_states).view(hidden_shape).transpose(1, 2)
+
+    cos, sin = position_embeddings
+    query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin)
+
+    if past_key_value is not None:
+        cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
+
+        # =============== Enable Query Cache ============
+        if not hasattr(past_key_value, "query_cache"):
+            past_key_value.query_cache = {}
+
+        if self.layer_idx not in past_key_value.query_cache:
+            # prefill stage
+            bsz, n_heads, _, head_dim = query_states.shape
+            past_key_value.query_cache[self.layer_idx] = torch.empty(
+                bsz, n_heads, 0, head_dim
+            )
+            past_key_value.query_cache[self.layer_idx] = query_states[
+                :, :, -self.config.method_config["window_size"] :, :
+            ]
+        else:
+            # Add current query to cache
+            past_key_value.query_cache[self.layer_idx] = torch.cat(
+                (past_key_value.query_cache[self.layer_idx], query_states), dim=2
+            )  # [batch, n_q_heads, seq_len, head_dim]
+
+            # Keep only window_size most recent queries
+            window_size = self.config.method_config["window_size"]
+            if past_key_value.query_cache[self.layer_idx].shape[-2] > window_size:
+                past_key_value.query_cache[self.layer_idx] = past_key_value.query_cache[
+                    self.layer_idx
+                ][:, :, -window_size:, :]
+        # =============== Enable Query Cache end ===============
+
+        # =============== decoding-time compression start ===============
+        cached_queries = past_key_value.query_cache[self.layer_idx]
+        if kvcomm_should_compress is None:
+            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                key_states,
+                cached_queries,  # Use cached queries instead of current query
+                value_states,
+                state_key=kvcomm_state_key,
+            )
+
+            if self.config.update_kv is True:
+                past_key_value.update(
+                    key_states_compress,
+                    value_states_compress,
+                    self.layer_idx,
+                    cache_kwargs,
+                )
+            else:
+                past_key_value.update(
+                    key_states,
+                    value_states,
+                    self.layer_idx,
+                    cache_kwargs,
+                )
+
+        elif kvcomm_should_compress is True:
+            key_states, value_states = past_key_value.update(
+                key_states,
+                value_states,
+                self.layer_idx,
+                cache_kwargs,
+            )
+
+            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                key_states,
+                cached_queries,  # Use cached queries instead of current query
+                value_states,
+                state_key=kvcomm_state_key,
+            )
+            if self.config.update_kv is True:
+                past_key_value.key_cache[self.layer_idx] = key_states_compress
+                past_key_value.value_cache[self.layer_idx] = value_states_compress
+        else:
+            key_states, value_states = past_key_value.update(
+                key_states, value_states, self.layer_idx, cache_kwargs
+            )
+        # =============== decoding-time compression end ===============
+
+    sliding_window = None
+    if (
+        self.config.use_sliding_window
+        and getattr(self.config, "sliding_window", None) is not None
+        and self.layer_idx >= self.config.max_window_layers
+    ):
+        sliding_window = self.config.sliding_window
+
+    attention_interface: Callable = eager_attention_forward
+    if self.config._attn_implementation != "eager":
+        if self.config._attn_implementation == "sdpa" and kwargs.get(
+            "output_attentions", False
+        ):
+            logger.warning_once(
+                "`torch.nn.functional.scaled_dot_product_attention` does not support `output_attentions=True`. Falling back to "
+                'eager attention. This warning can be removed using the argument `attn_implementation="eager"` when loading the model.'
+            )
+        else:
+            attention_interface = ALL_ATTENTION_FUNCTIONS[
+                self.config._attn_implementation
+            ]
+
+    attn_output, attn_weights = attention_interface(
+        self,
+        query_states,
+        key_states,
+        value_states,
+        attention_mask,
+        dropout=0.0 if not self.training else self.attention_dropout,
+        scaling=self.scaling,
+        sliding_window=sliding_window,  # main diff with Llama
+        **kwargs,
+    )
+
+    attn_output = attn_output.reshape(*input_shape, -1).contiguous()
+    attn_output = self.o_proj(attn_output)
+    return attn_output, attn_weights
+
 
 def CausalLM_forward(
     self,
