@@ -132,6 +132,7 @@ class LLMChat(LLM):
     _shared_compress_budget: Optional[int] = None
     _shared_compress_divide_length: Optional[int] = None
     _shared_kvcomm_patched: Optional[bool] = None
+    _shared_model_dtype: Optional[str] = None
     _model_lock = threading.Lock()
 
     def __init__(
@@ -143,6 +144,7 @@ class LLMChat(LLM):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        model_dtype: str = "float16",
     ):
         self.model_name = model_name
         self.config = (config or KVCommConfig.from_env()).validate()
@@ -150,6 +152,7 @@ class LLMChat(LLM):
         self.compress_method = (compress_method or "rkv").lower().strip()
         self.compress_budget = int(compress_budget)
         self.compress_divide_length = int(compress_divide_length)
+        self.model_dtype = (model_dtype or "float16").lower().strip()
         self.lock = asyncio.Lock()
         self._initialize_shared_resources()
         self._kvcomm_enabled = bool(self.compress_mode and LLMChat._shared_kvcomm_patched)
@@ -510,10 +513,31 @@ class LLMChat(LLM):
             "divide_length": self.compress_divide_length,
         }
 
+    def _resolve_torch_dtype(self) -> Union[torch.dtype, str]:
+        mapping: Dict[str, Union[torch.dtype, str]] = {
+            "float16": torch.float16,
+            "fp16": torch.float16,
+            "half": torch.float16,
+            "bfloat16": torch.bfloat16,
+            "bf16": torch.bfloat16,
+            "float32": torch.float32,
+            "fp32": torch.float32,
+            "auto": "auto",
+        }
+        resolved = mapping.get(self.model_dtype)
+        if resolved is None:
+            supported = ", ".join(sorted(mapping.keys()))
+            raise ValueError(
+                f"Unsupported model_dtype: {self.model_dtype}. "
+                f"Supported values: {supported}."
+            )
+        return resolved
+
     def _initialize_shared_resources(self):
         with LLMChat._model_lock:
             if LLMChat._shared_model is None:
                 kvcomm_patched = False
+                resolved_dtype = self._resolve_torch_dtype()
                 if self.compress_mode:
                     model_name_lower = self.model_name.lower()
                     if "llama" in model_name_lower:
@@ -531,9 +555,9 @@ class LLMChat(LLM):
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
                 LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=torch.float16,
+                    torch_dtype=resolved_dtype,
                     low_cpu_mem_usage=True,
-                    device_map="cuda:0",
+                    device_map="auto",
                     trust_remote_code=True,
                 )
                 LLMChat._shared_compress_mode = self.compress_mode
@@ -541,7 +565,18 @@ class LLMChat(LLM):
                 LLMChat._shared_compress_budget = self.compress_budget
                 LLMChat._shared_compress_divide_length = self.compress_divide_length
                 LLMChat._shared_kvcomm_patched = kvcomm_patched
-                logger.info("Model {} loaded and shared across instances.", self.model_name)
+                LLMChat._shared_model_dtype = self.model_dtype
+                logger.info(
+                    "Model {} loaded and shared across instances with dtype {}.",
+                    self.model_name,
+                    self.model_dtype,
+                )
+            elif LLMChat._shared_model_dtype != self.model_dtype:
+                logger.warning(
+                    "Model already loaded with dtype {}. Requested dtype {} is ignored.",
+                    LLMChat._shared_model_dtype,
+                    self.model_dtype,
+                )
 
     def __getstate__(self):
         state = self.__dict__.copy()

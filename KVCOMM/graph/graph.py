@@ -54,6 +54,7 @@ class Graph(ABC):
                 compress_method: str = "rkv",
                 compress_budget: int = 1024,
                 compress_divide_length: int = 128,
+                model_dtype: str = "float16",
                 ):
 
         num_agents = len(agent_names)
@@ -74,6 +75,7 @@ class Graph(ABC):
         self.compress_method = (compress_method or "rkv").lower().strip()
         self.compress_budget = int(compress_budget)
         self.compress_divide_length = int(compress_divide_length)
+        self.model_dtype = (model_dtype or "float16").lower().strip()
         self.decision_node:Node = AgentRegistry.get(
             decision_method,
             **{
@@ -84,6 +86,7 @@ class Graph(ABC):
                 "compress_method": self.compress_method,
                 "compress_budget": self.compress_budget,
                 "compress_divide_length": self.compress_divide_length,
+                "model_dtype": self.model_dtype,
             },
         ) if decision_method is not None else None
         self.nodes:Dict[str,Node] = {}
@@ -96,6 +99,7 @@ class Graph(ABC):
             kwargs.setdefault("compress_method", self.compress_method)
             kwargs.setdefault("compress_budget", self.compress_budget)
             kwargs.setdefault("compress_divide_length", self.compress_divide_length)
+            kwargs.setdefault("model_dtype", self.model_dtype)
 
         self.init_nodes()                              
         self.init_potential_edges()                                                                   

@@ -21,6 +21,7 @@ class FinalWriteCode(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        model_dtype: str = "float16",
     ):
         super().__init__(id, "FinalWriteCode" ,domain, llm_name)
         prefix = ""
@@ -32,6 +33,7 @@ class FinalWriteCode(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            model_dtype=model_dtype,
         )
         self.role = 'FinalWriteCode'
         self.llm.set_id(self.id, 'FinalWriteCode')
@@ -212,6 +214,7 @@ class FinalRefer(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        model_dtype: str = "float16",
     ):
         super().__init__(id, "FinalRefer" ,domain, llm_name)
         prefix = ""
@@ -223,6 +226,7 @@ class FinalRefer(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            model_dtype=model_dtype,
         )
         self.role = 'FinalRefer'
         self.llm.set_id(self.id, 'FinalRefer')
@@ -347,6 +351,7 @@ class FinalDirect(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        model_dtype: str = "float16",
     ):
         """ Used for Directed IO """
         super().__init__(id, "FinalDirect")
@@ -392,6 +397,7 @@ class FinalMajorVote(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        model_dtype: str = "float16",
     ):
         """ Used for Directed IO """
         super().__init__(id, "FinalMajorVote")

@@ -73,6 +73,7 @@ def parse_args():
     parser.add_argument("--compress-method", type=str, default="rkv", help="Compression method: rkv/snapkv/streamingllm/h2o.")
     parser.add_argument("--compress-budget", type=int, default=1024, help="Compression KV budget.")
     parser.add_argument("--compress-divide-length", type=int, default=128, help="Compression divide length.")
+    parser.add_argument("--model-dtype", type=str, default="float16", help="Model load dtype: float16/bfloat16/float32/auto.")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
@@ -171,6 +172,7 @@ async def main():
         compress_method=args.compress_method,
         compress_budget=args.compress_budget,
         compress_divide_length=args.compress_divide_length,
+        model_dtype=args.model_dtype,
         **kwargs,
     )
 

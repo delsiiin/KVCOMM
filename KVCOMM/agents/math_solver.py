@@ -21,6 +21,7 @@ class MathSolver(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        model_dtype: str = "float16",
     ):
         super().__init__(id, "MathSolver" ,domain, llm_name)
         prefix = "A: "
@@ -32,6 +33,7 @@ class MathSolver(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            model_dtype=model_dtype,
         )
         self.prompt_set = PromptSetRegistry.get(domain)
         self.role = self.prompt_set.get_role() if role is None else role
