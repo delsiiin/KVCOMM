@@ -182,6 +182,7 @@ async def main():
                 code = candidate.split("```python\n")[-1].split("\n```")[0]
             else:
                 code = str(candidate)
+            code = code.replace("!", " ")
 
             is_solved, _, _ = PyExecutor().execute(code, [tests], timeout=100)
             total_solved += is_solved
