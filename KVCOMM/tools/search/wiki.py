@@ -1,26 +1,11 @@
-import wikipedia
 import asyncio
 import aiohttp
-import socket
+import os
 
 WIKI_API_URL = "https://en.wikipedia.org/w/api.php"
-REQUEST_TIMEOUT = aiohttp.ClientTimeout(total=20, connect=5, sock_connect=5, sock_read=10)
+PROXY = os.environ.get("http_proxy") or os.environ.get("HTTP_PROXY")
 
-class WikiSearch:
-    def __init__(self):
-        self.name = "Wikipedia SearchEngine"
-        self.description = "Seach for an item in Wikipedia"
-
-    def search(self, query):
-        result = wikipedia.search(query[:300], results=1, suggestion=True)
-        if len(result[0]) != 0:
-            return wikipedia.page(title=result[0]).content
-        if result[1] is not None:
-            result = wikipedia.search(result[1], results=1)
-            return wikipedia.page(title=result[0]).content
-        return None
-
-async def fetch_summary(session, title):
+async def fetch_summary(session, title, proxy=None):
     params = {
         "action": "query",
         "prop": "extracts",
@@ -29,55 +14,19 @@ async def fetch_summary(session, title):
         "titles": title,
         "format": "json"
     }
-    data = await _get_json_with_retry(session, WIKI_API_URL, params)
-    if not data:
-        return ""
-    pages = data.get("query", {}).get("pages", {})
-    for _, page_data in pages.items():
-        return page_data.get("extract", "")
+    try:
+        async with session.get(WIKI_API_URL, params=params, proxy=proxy) as resp:
+            if resp.status != 200:
+                return ""
+            data = await resp.json(content_type=None)
+            pages = data.get("query", {}).get("pages", {})
+            for _, page_data in pages.items():
+                return page_data.get("extract", "")
+    except Exception as e:
+        print(f"fetch_summary error for {title}: {e}")
     return ""
 
-
-async def _get_json_with_retry(session, url, params, retries=2):
-    for attempt in range(retries + 1):
-        try:
-            async with session.get(url, params=params) as resp:
-                if resp.status != 200:
-                    return None
-                return await resp.json(content_type=None)
-        except (aiohttp.ClientConnectorError, aiohttp.ClientOSError, asyncio.TimeoutError):
-            if attempt == retries:
-                return None
-            await asyncio.sleep(0.2 * (attempt + 1))
-    return None
-
-async def get_wikipedia_summary(title):
-    try:
-        wikipedia.set_lang("en")
-        return wikipedia.summary(title)
-    except wikipedia.exceptions.DisambiguationError as e:
-        return await get_wikipedia_summary(e.options[0])
-    except wikipedia.exceptions.PageError:
-        return ""
-
-async def search_wiki(query):
-    wikipedia.set_lang("en")
-    result = wikipedia.search(query, results=2, suggestion=True)
-    ret, tasks = "", []
-    if len(result[0]) != 0:
-        for res in result[0]:
-            tasks.append(get_wikipedia_summary(res))
-        summaries = await asyncio.gather(*tasks)
-        for res, summa in zip(result[0], summaries):
-            if summa:
-                ret += f"The summary of {res} in Wikipedia is: {summa}\n"
-    if result[1] is not None:
-        summa = await get_wikipedia_summary(result[1])
-        if summa:
-            ret += f"The summary of {result[1]} in Wikipedia is: {summa}\n"
-    return ret
-
-async def search_wiki_api(query, session):
+async def search_wiki_api(query, session, proxy=None):
     search_params = {
         "action": "query",
         "list": "search",
@@ -86,30 +35,44 @@ async def search_wiki_api(query, session):
         "srlimit": 2,
         "formatversion": "2",
     }
-    data = await _get_json_with_retry(session, WIKI_API_URL, search_params)
-    if not data:
-        return ""
-    results = data.get("query", {}).get("search", [])
-    ret = ""
-    for r in results:
-        title = r.get("title", "")
-        if not title:
-            continue
-        summary = await fetch_summary(session, title)
-        ret += f"The summary of {title} in Wikipedia is: {summary}\n"
-    return ret
+    try:
+        async with session.get(WIKI_API_URL, params=search_params, proxy=proxy) as resp:
+            if resp.status != 200:
+                return ""
+            data = await resp.json(content_type=None)
+            results = data.get("query", {}).get("search", [])
+            ret = ""
+            for r in results:
+                title = r.get("title", "")
+                if not title:
+                    continue
+                summary = await fetch_summary(session, title, proxy)
+                if summary:
+                    ret += f"The summary of {title} in Wikipedia is: {summary}\n"
+            return ret
+    except Exception as e:
+        print(f"search_wiki_api error for {query}: {e}")
+    return ""
 
 async def search_wiki_main(queries):
     headers = {
         "Accept": "application/json",
-        "User-Agent": "KVCOMM/0.1 (contact@gmail.com)"
+        "User-Agent": "MyWikiBot/1.0 (contact: your_email@example.com)"
     }
-    connector = aiohttp.TCPConnector(family=socket.AF_INET, ttl_dns_cache=300)
-    async with aiohttp.ClientSession(headers=headers, connector=connector, timeout=REQUEST_TIMEOUT) as session:
-        tasks = [search_wiki_api(query, session) for query in queries]
-        results = await asyncio.gather(*tasks)
+    timeout = aiohttp.ClientTimeout(total=20)
+    connector = aiohttp.TCPConnector(ssl=False)  # 先用于排查 SSL 问题
+
+    async with aiohttp.ClientSession(
+        headers=headers,
+        timeout=timeout,
+        connector=connector
+    ) as session:
+        tasks = [search_wiki_api(query, session, PROXY) for query in queries]
+        results = await asyncio.gather(*tasks, return_exceptions=True)
     return results
 
 if __name__ == "__main__":
     queries = ["Python", "Asyncio", "Wikipedia"]
-    asyncio.run(search_wiki_main(queries))
+    results = asyncio.run(search_wiki_main(queries))
+    for r in results:
+        print(r)
