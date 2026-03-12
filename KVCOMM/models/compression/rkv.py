@@ -80,10 +80,6 @@ class RKV:
             # shape: (bsz, num_kv_heads, budget - window_size)
             indices = final_score.topk(self.budget - self.window_size, dim=-1).indices
 
-            print(
-                f"Layer {self.layer_idx}: kv_cache_len={kv_cache_len}, selected {indices.shape[-1]} tokens for compression."
-            )
-
             indices = indices.unsqueeze(-1).expand(-1, -1, -1, head_dim)
 
             k_past_compress = key_states[:, :, : -self.window_size, :].gather(

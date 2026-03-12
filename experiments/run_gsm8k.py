@@ -232,6 +232,11 @@ async def main():
         run_tag=run_tag,
         plot_hist=args.plot_length_hist,
     )
+    metrics_recorder.export_tool_length_artifacts(
+        output_dir=output_dir / "length_stats",
+        run_tag=run_tag,
+        plot_hist=args.plot_length_hist,
+    )
 
 
 def get_kwargs(

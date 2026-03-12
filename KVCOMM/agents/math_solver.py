@@ -100,5 +100,10 @@ class MathSolver(Node):
         )
         if self.role == "Programming Expert":
             answer = execute_code_get_return(result.text.lstrip("```python\n").rstrip("\n```"))
+            self.record_tool_output(
+                input,
+                tool_name="execute_code_get_return",
+                tool_output_text=answer,
+            )
             result.text += f"\nthe answer is {answer}"
         return result

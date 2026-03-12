@@ -195,6 +195,52 @@ class Node(ABC):
                     )
         return self.outputs
 
+    def _tool_output_token_len(self, tool_output_text: str) -> Optional[int]:
+        tokenizer = getattr(getattr(self, "llm", None), "tokenizer", None)
+        if tokenizer is None:
+            return None
+        text = "" if tool_output_text is None else str(tool_output_text)
+        try:
+            encoded = tokenizer.encode(text, add_special_tokens=False)
+            return len(encoded)
+        except Exception:
+            try:
+                tokenized = tokenizer(text, return_tensors="pt", add_special_tokens=False)
+            except Exception:
+                return None
+            input_ids = tokenized.get("input_ids") if isinstance(tokenized, dict) else None
+            if input_ids is None:
+                return None
+            return int(input_ids.shape[-1])
+
+    def record_tool_output(
+        self,
+        input_data: Any,
+        *,
+        tool_name: str,
+        tool_output_text: Any,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Record one tool-output event using the current request/round context."""
+        if not isinstance(input_data, dict):
+            return
+        request_uid = input_data.get("_request_uid")
+        if not request_uid:
+            return
+        normalised_text = "" if tool_output_text is None else str(tool_output_text)
+        metrics_recorder.record_tool_output(
+            request_uid=request_uid,
+            agent_id=self.id,
+            agent_name=self.agent_name,
+            agent_role=self.role,
+            tool_name=tool_name,
+            tool_output_text=normalised_text,
+            tool_output_char_len=len(normalised_text),
+            tool_output_token_len=self._tool_output_token_len(normalised_text),
+            round_index=input_data.get("_round_index"),
+            metadata=metadata,
+        )
+
     @abstractmethod
     def _execute(self, input:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):
         """ To be overriden by the descendant class """

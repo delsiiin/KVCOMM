@@ -31,6 +31,7 @@ class RequestMetricsRecorder:
         self._total_default_calls: int = 0
         self._ttft_stats: Dict[str, Dict[str, float]] = {}
         self._agent_events: List[Dict[str, Any]] = []
+        self._tool_events: List[Dict[str, Any]] = []
 
     def reset(self) -> None:
         """Clear all cached request-level and per-agent metrics."""
@@ -40,6 +41,7 @@ class RequestMetricsRecorder:
             self._total_default_calls = 0
             self._ttft_stats.clear()
             self._agent_events.clear()
+            self._tool_events.clear()
 
     def start_request(
         self,
@@ -188,6 +190,58 @@ class RequestMetricsRecorder:
                     "output_token_len": output_token_len,
                 }
             )
+
+    def record_tool_output(
+        self,
+        *,
+        request_uid: str,
+        agent_id: str,
+        agent_name: str,
+        agent_role: str,
+        tool_name: str,
+        tool_output_text: str,
+        tool_output_char_len: Optional[int] = None,
+        tool_output_token_len: Optional[int] = None,
+        round_index: Optional[int] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        """Log one tool-call output event for later aggregation/export."""
+        with self._lock:
+            request_entry = self._requests.setdefault(
+                request_uid,
+                {
+                    "batch_index": None,
+                    "task": None,
+                    "execution_mode": "unknown",
+                    "agents": [],
+                    "default_count": 0,
+                    "total_count": 0,
+                },
+            )
+            normalised_text = "" if tool_output_text is None else str(tool_output_text)
+            payload = {
+                "request_uid": request_uid,
+                "batch_index": request_entry.get("batch_index"),
+                "task": request_entry.get("task"),
+                "execution_mode": request_entry.get("execution_mode"),
+                "round_index": round_index,
+                "agent_id": agent_id,
+                "agent_name": agent_name,
+                "agent_role": agent_role,
+                "tool_name": tool_name,
+                "tool_output_text": normalised_text,
+                "tool_output_char_len": self._normalise_length(tool_output_char_len)
+                if tool_output_char_len is not None
+                else len(normalised_text),
+                "tool_output_token_len": self._normalise_length(tool_output_token_len),
+            }
+            if metadata:
+                payload["metadata"] = metadata
+            logger.opt(colors=True).info(
+                "<green>[TOOL OUTPUT]</green> {}",
+                json.dumps(payload, ensure_ascii=False),
+            )
+            self._tool_events.append(payload)
 
     def finalize_request(self, request_uid: str) -> Optional[float]:
         """Compute and log per-request default-mode statistics."""
@@ -378,6 +432,107 @@ class RequestMetricsRecorder:
         fig.savefig(out_path, dpi=220, bbox_inches="tight")
         plt.close(fig)
         return out_path
+
+    def export_tool_length_artifacts(
+        self,
+        *,
+        output_dir: str | Path,
+        run_tag: str,
+        plot_hist: bool = True,
+    ) -> Dict[str, str]:
+        """Dump per-agent tool-output events and histogram plot to disk."""
+        with self._lock:
+            events = list(self._tool_events)
+        if not events:
+            logger.warning("No tool events captured for {}. Skip exporting tool length artifacts.", run_tag)
+            return {}
+
+        output_path = Path(output_dir).expanduser()
+        output_path.mkdir(parents=True, exist_ok=True)
+
+        events_file = output_path / f"{run_tag}_tool_output_events.json"
+        with events_file.open("w", encoding="utf-8") as handle:
+            json.dump(events, handle, ensure_ascii=False, indent=2)
+
+        per_agent: Dict[str, Dict[str, Any]] = {}
+        for event in events:
+            agent_id = str(event.get("agent_id"))
+            group = per_agent.setdefault(
+                agent_id,
+                {
+                    "agent_name": event.get("agent_name"),
+                    "agent_role": event.get("agent_role"),
+                    "round_indices": set(),
+                    "tool_names": set(),
+                    "tool_call_count": 0,
+                    "tool_output_values": [],
+                },
+            )
+            if (not group.get("agent_name")) and event.get("agent_name"):
+                group["agent_name"] = event.get("agent_name")
+            if (not group.get("agent_role")) and event.get("agent_role"):
+                group["agent_role"] = event.get("agent_role")
+            round_index = event.get("round_index")
+            if round_index is not None:
+                group["round_indices"].add(round_index)
+            tool_name = str(event.get("tool_name", "")).strip()
+            if tool_name:
+                group["tool_names"].add(tool_name)
+            group["tool_call_count"] += 1
+            tool_output_token_len = self._normalise_length(event.get("tool_output_token_len"))
+            if tool_output_token_len is not None:
+                group["tool_output_values"].append(tool_output_token_len)
+
+        summary = {
+            "run_tag": run_tag,
+            "unit": "tokens",
+            "tool_output_length_field": "tool_output_token_len",
+            "num_events": len(events),
+            "agent_id_role_map": {},
+            "agents": {},
+        }
+        for agent_id, data in sorted(per_agent.items(), key=lambda item: self._agent_sort_key(item[0])):
+            tool_output_values = data.pop("tool_output_values")
+            round_indices = sorted(data.pop("round_indices"))
+            tool_names = sorted(data.pop("tool_names"))
+            tool_call_count = data.pop("tool_call_count")
+            summary["agent_id_role_map"][agent_id] = data.get("agent_role")
+            summary["agents"][agent_id] = {
+                **data,
+                "round_indices": round_indices,
+                "round_count": len(round_indices),
+                "tool_names": tool_names,
+                "tool_call_count": tool_call_count,
+                "tool_output_stats": self._describe(tool_output_values),
+            }
+
+        summary_file = output_path / f"{run_tag}_tool_output_summary.json"
+        with summary_file.open("w", encoding="utf-8") as handle:
+            json.dump(summary, handle, ensure_ascii=False, indent=2)
+
+        output_plot = None
+        if plot_hist:
+            output_plot = self._plot_hist_by_agent(
+                events=events,
+                value_key="tool_output_token_len",
+                value_name="Tool output length",
+                out_path=output_path / f"{run_tag}_tool_output_length_hist_by_agent.png",
+                run_tag=run_tag,
+                unit="tokens",
+            )
+
+        artifacts = {
+            "events_json": str(events_file),
+            "summary_json": str(summary_file),
+            "plot_hist": str(plot_hist),
+        }
+        if output_plot is not None:
+            artifacts["output_hist_png"] = str(output_plot)
+        logger.opt(colors=True).info(
+            "<blue>[TOOL LENGTH ARTIFACTS]</blue> {}",
+            json.dumps(artifacts, ensure_ascii=False),
+        )
+        return artifacts
 
     def export_agent_length_artifacts(
         self,

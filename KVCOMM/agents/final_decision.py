@@ -125,6 +125,16 @@ class FinalWriteCode(Node):
                     answer = execute_code_get_return(
                         info["output"].split("```python\n")[-1].split("\n```")[0]
                     )
+                    self.record_tool_output(
+                        raw_inputs,
+                        tool_name="execute_code_get_return",
+                        tool_output_text=answer,
+                        metadata={
+                            "source": "spatial",
+                            "peer_agent_id": agent_id,
+                            "peer_agent_role": info.get("role"),
+                        },
+                    )
                     agent_output += f"\n the result is {answer}"
                 spatial_str += (
                     f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"
@@ -139,6 +149,17 @@ class FinalWriteCode(Node):
                     code = info["output"].split("```python\n")[-1].split("\n```")[0]
                     is_solved, feedback, _ = PyExecutor().execute(
                         code, getattr(self, "internal_tests", []), timeout=10
+                    )
+                    self.record_tool_output(
+                        raw_inputs,
+                        tool_name="PyExecutor.execute",
+                        tool_output_text=feedback,
+                        metadata={
+                            "is_solved": bool(is_solved),
+                            "source": "spatial",
+                            "peer_agent_id": agent_id,
+                            "peer_agent_role": info.get("role"),
+                        },
                     )
                     spatial_str += (
                         f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"
@@ -253,6 +274,16 @@ class FinalRefer(Node):
                     answer = execute_code_get_return(
                         info["output"].split("```python\n")[-1].split("\n```")[0]
                     )
+                    self.record_tool_output(
+                        raw_inputs,
+                        tool_name="execute_code_get_return",
+                        tool_output_text=answer,
+                        metadata={
+                            "source": "spatial",
+                            "peer_agent_id": agent_id,
+                            "peer_agent_role": info.get("role"),
+                        },
+                    )
                     agent_output += f"\n the result is {answer}"
                 spatial_str += (
                     f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"
@@ -267,6 +298,17 @@ class FinalRefer(Node):
                     code = info["output"].split("```python\n")[-1].split("\n```")[0]
                     is_solved, feedback, _ = PyExecutor().execute(
                         code, getattr(self, "internal_tests", []), timeout=10
+                    )
+                    self.record_tool_output(
+                        raw_inputs,
+                        tool_name="PyExecutor.execute",
+                        tool_output_text=feedback,
+                        metadata={
+                            "is_solved": bool(is_solved),
+                            "source": "spatial",
+                            "peer_agent_id": agent_id,
+                            "peer_agent_role": info.get("role"),
+                        },
                     )
                     spatial_str += (
                         f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"

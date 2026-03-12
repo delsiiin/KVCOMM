@@ -56,6 +56,17 @@ class CodeWriting(Node):
             if info['output'].startswith("```python") and info['output'].endswith("```") and self.role != 'Normal Programmer' and self.role != 'Stupid Programmer':
                 output = info['output'].split("```python\n")[-1].split("\n```")[0]
                 is_solved, feedback, state = PyExecutor().execute(output, self.internal_tests, timeout=10)
+                self.record_tool_output(
+                    raw_inputs,
+                    tool_name="PyExecutor.execute",
+                    tool_output_text=feedback,
+                    metadata={
+                        "is_solved": bool(is_solved),
+                        "source": "spatial",
+                        "peer_agent_id": id,
+                        "peer_agent_role": info.get("role"),
+                    },
+                )
                 spatial_str += f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n Whether it passes internal testing?\n{is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
             else:
                 spatial_str += f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n"
@@ -63,6 +74,17 @@ class CodeWriting(Node):
             if info['output'].startswith("```python") and info['output'].endswith("```") and self.role != 'Normal Programmer' and self.role != 'Stupid Programmer':
                 output = info['output'].split("```python\n")[-1].split("\n```")[0]
                 is_solved, feedback, state = PyExecutor().execute(output, self.internal_tests, timeout=10)
+                self.record_tool_output(
+                    raw_inputs,
+                    tool_name="PyExecutor.execute",
+                    tool_output_text=feedback,
+                    metadata={
+                        "is_solved": bool(is_solved),
+                        "source": "temporal",
+                        "peer_agent_id": id,
+                        "peer_agent_role": info.get("role"),
+                    },
+                )
                 temporal_str += f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n Whether it passes internal testing? {is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
             else:
                 temporal_str += f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n"

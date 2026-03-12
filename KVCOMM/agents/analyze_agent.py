@@ -71,6 +71,15 @@ class AnalyzeAgent(Node):
                     token_ids = self.llm.tokenizer(self.wiki_summary, return_tensors="pt", add_special_tokens=False)
                     token_ids = {k: v[:, :WIKI_TOKEN_LENGTH].to(self.llm.model.device) for k, v in token_ids.items() if isinstance(v, torch.Tensor)}
                     self.wiki_summary = self.llm.tokenizer.decode(token_ids['input_ids'][0], skip_special_tokens=True)
+                    self.record_tool_output(
+                        raw_inputs,
+                        tool_name="search_wiki_main",
+                        tool_output_text=self.wiki_summary,
+                        metadata={
+                            "query_count": len(queries),
+                            "source_role": info.get("role"),
+                        },
+                    )
                     user_prompt += f"The key entities of the problem are explained in Wikipedia as follows:{self.wiki_summary}"
             spatial_str += f"Agent {id}, role is {info['role']}, output is:\n\n {info['output']}\n\n"
         for id, info in temporal_info.items():

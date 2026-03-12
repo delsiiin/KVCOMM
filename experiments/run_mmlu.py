@@ -129,6 +129,11 @@ async def main():
         run_tag=run_tag,
         plot_hist=args.plot_length_hist,
     )
+    tool_length_artifacts = metrics_recorder.export_tool_length_artifacts(
+        output_dir=output_dir / "length_stats",
+        run_tag=run_tag,
+        plot_hist=args.plot_length_hist,
+    )
     logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
     result_file = output_dir / f"{args.domain}_{safe_llm_name}_{compression_tag}_{timestamp}.json"
     result_file.touch(exist_ok=True)
@@ -138,6 +143,7 @@ async def main():
         "agent_nums": args.agent_nums,
         "timestamp": timestamp,
         "length_artifacts": length_artifacts,
+        "tool_length_artifacts": tool_length_artifacts,
     }
     with open(result_file, "w", encoding="utf-8") as handle:
         json.dump(payload, handle, ensure_ascii=False, indent=2)
