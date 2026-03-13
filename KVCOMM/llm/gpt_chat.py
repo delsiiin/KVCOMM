@@ -20,6 +20,7 @@ from KVCOMM.llm.format import Message
 from KVCOMM.llm.llm import LLM
 from KVCOMM.llm.llm_registry import LLMRegistry
 from KVCOMM.models.monkeypatch import replace_llama, replace_qwen2
+from KVCOMM.utils.attention_heatmap import export_attention_heatmap
 from KVCOMM.utils.log import logger
 from KVCOMM.utils.metrics import GenerationResult
 
@@ -95,6 +96,7 @@ class GPTChat(LLM):
         agent_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
+        round_index: Optional[int] = None,
     ) -> GenerationResult:
         normalised = LLMChat._normalise_messages(messages)
         input_char_len = _total_message_chars(normalised)
@@ -108,6 +110,8 @@ class GPTChat(LLM):
             metadata["agent_name"] = agent_name
         if agent_role:
             metadata["agent_role"] = agent_role
+        if round_index is not None:
+            metadata["round_index"] = round_index
         metadata["input_char_len"] = input_char_len
         metadata["output_char_len"] = len(response_text) if response_text is not None else 0
         return GenerationResult(text=response_text, mode="default", ttft=0.0, metadata=metadata)
@@ -131,6 +135,8 @@ class LLMChat(LLM):
     _shared_compress_method: Optional[str] = None
     _shared_compress_budget: Optional[int] = None
     _shared_compress_divide_length: Optional[int] = None
+    _shared_attn_heatmap_mode: Optional[bool] = None
+    _shared_attn_heatmap_layer: Optional[int] = None
     _shared_kvcomm_patched: Optional[bool] = None
     _shared_model_dtype: Optional[str] = None
     _model_lock = threading.Lock()
@@ -144,6 +150,10 @@ class LLMChat(LLM):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        attn_heatmap_mode: bool = False,
+        attn_heatmap_layer: Optional[int] = None,
+        attn_heatmap_output_dir: Optional[str] = None,
+        attn_heatmap_run_tag: Optional[str] = None,
         model_dtype: str = "float16",
     ):
         self.model_name = model_name
@@ -152,10 +162,19 @@ class LLMChat(LLM):
         self.compress_method = (compress_method or "rkv").lower().strip()
         self.compress_budget = int(compress_budget)
         self.compress_divide_length = int(compress_divide_length)
+        self.attn_heatmap_mode = bool(attn_heatmap_mode)
+        self.attn_heatmap_layer = (
+            int(attn_heatmap_layer) if attn_heatmap_layer is not None else None
+        )
+        self.attn_heatmap_output_dir = attn_heatmap_output_dir
+        self.attn_heatmap_run_tag = attn_heatmap_run_tag
         self.model_dtype = (model_dtype or "float16").lower().strip()
         self.lock = asyncio.Lock()
         self._initialize_shared_resources()
-        self._kvcomm_enabled = bool(self.compress_mode and LLMChat._shared_kvcomm_patched)
+        self._kvcomm_enabled = bool(
+            (self.compress_mode or self.attn_heatmap_mode)
+            and LLMChat._shared_kvcomm_patched
+        )
         self._kvcomm_call_seq = 0 if self._kvcomm_enabled else None
         self.tokenizer = LLMChat._shared_tokenizer
         self.model = LLMChat._shared_model
@@ -371,6 +390,64 @@ class LLMChat(LLM):
         seq_states = getattr(self.model, "_kvcomm_seq_states", None)
         if isinstance(seq_states, dict):
             seq_states.pop(state_key, None)
+        heatmap_captures = getattr(self.model, "_kvcomm_heatmap_captures", None)
+        if isinstance(heatmap_captures, dict):
+            heatmap_captures.pop(state_key, None)
+
+    def _pop_attention_heatmap_capture(
+        self, state_key: Optional[str]
+    ) -> Optional[Dict[str, Any]]:
+        if (not self.attn_heatmap_mode) or (not state_key):
+            return None
+        captures = getattr(self.model, "_kvcomm_heatmap_captures", None)
+        if not isinstance(captures, dict):
+            return None
+        capture = captures.pop(state_key, None)
+        if not isinstance(capture, dict):
+            return None
+        if capture.get("matrix") is None:
+            return None
+        return capture
+
+    def _export_attention_heatmap_if_needed(
+        self,
+        *,
+        state_key: Optional[str],
+        request_uid: Optional[str],
+        round_index: Optional[int],
+        agent_id: Optional[str],
+        agent_name: Optional[str],
+        agent_role: Optional[str],
+        input_token_len: Optional[int],
+        output_token_len: Optional[int],
+    ) -> Optional[Dict[str, str]]:
+        if not self.attn_heatmap_mode:
+            return None
+        if not self.attn_heatmap_output_dir or not self.attn_heatmap_run_tag:
+            logger.warning("Attention heatmap mode is enabled, but artifact context is missing.")
+            return None
+        capture = self._pop_attention_heatmap_capture(state_key)
+        if capture is None:
+            logger.warning(
+                "No captured attention heatmap found for request={} agent={} layer={}.",
+                request_uid,
+                agent_id,
+                self.attn_heatmap_layer,
+            )
+            return None
+        return export_attention_heatmap(
+            matrix=capture.get("matrix"),
+            output_dir=self.attn_heatmap_output_dir,
+            run_tag=self.attn_heatmap_run_tag,
+            request_uid=request_uid,
+            round_index=round_index,
+            agent_id=agent_id,
+            agent_name=agent_name,
+            agent_role=agent_role,
+            layer_idx=int(capture.get("layer_idx", self.attn_heatmap_layer or -1)),
+            input_token_len=input_token_len,
+            output_token_len=output_token_len,
+        )
 
     def gen(
         self,
@@ -394,8 +471,20 @@ class LLMChat(LLM):
         kvcomm_state_key = self._build_kvcomm_state_key()
         if kvcomm_state_key is not None:
             generation_kwargs["kvcomm_state_key"] = kvcomm_state_key
+        outputs = None
         try:
             outputs = self.model.generate(**inputs, **generation_kwargs)
+            generated_sequence = outputs.sequences[:, prompt_length:]
+            self._export_attention_heatmap_if_needed(
+                state_key=kvcomm_state_key,
+                request_uid=None,
+                round_index=None,
+                agent_id=getattr(self, "node_id", None),
+                agent_name=None,
+                agent_role=getattr(self, "role", None),
+                input_token_len=int(prompt_length),
+                output_token_len=int(generated_sequence.shape[-1]),
+            )
         finally:
             if kvcomm_state_key is not None:
                 self._cleanup_kvcomm_state(kvcomm_state_key)
@@ -414,6 +503,7 @@ class LLMChat(LLM):
         agent_id: Optional[str] = None,
         agent_name: Optional[str] = None,
         agent_role: Optional[str] = None,
+        round_index: Optional[int] = None,
         ) -> GenerationResult:
         async with self.lock:
             if max_tokens is None:
@@ -445,8 +535,20 @@ class LLMChat(LLM):
             ttft_tracer = _TTFTTracer(prompt_length)
             generation_kwargs["stopping_criteria"] = StoppingCriteriaList([ttft_tracer])
             ttft_tracer.reset(prompt_length)
+            outputs = None
             try:
                 outputs = self.model.generate(**inputs, **generation_kwargs)
+                generated_sequence = outputs.sequences[:, prompt_length:]
+                heatmap_artifacts = self._export_attention_heatmap_if_needed(
+                    state_key=kvcomm_state_key,
+                    request_uid=request_uid,
+                    round_index=round_index,
+                    agent_id=agent_id,
+                    agent_name=agent_name,
+                    agent_role=agent_role,
+                    input_token_len=int(prompt_length),
+                    output_token_len=int(generated_sequence.shape[-1]),
+                )
             finally:
                 if kvcomm_state_key is not None:
                     self._cleanup_kvcomm_state(kvcomm_state_key)
@@ -473,15 +575,19 @@ class LLMChat(LLM):
                 metadata["agent_name"] = agent_name
             if agent_role:
                 metadata["agent_role"] = agent_role
+            if round_index is not None:
+                metadata["round_index"] = round_index
             if return_cache:
                 metadata["kv_cache"] = outputs.past_key_values
             metadata["input_char_len"] = input_char_len
             metadata["output_char_len"] = len(response_message) if response_message is not None else 0
             metadata["input_token_len"] = int(prompt_length)
             metadata["output_token_len"] = int(generated_sequence.shape[-1])
+            if heatmap_artifacts is not None:
+                metadata["attn_heatmap_artifacts"] = heatmap_artifacts
             return GenerationResult(text=response_message, mode="default", ttft=ttft_value, metadata=metadata)
 
-    def _build_compression_config(self) -> Dict[str, Any]:
+    def _build_patch_config(self) -> Dict[str, Any]:
         method = self.compress_method
         supported_methods = {"rkv", "snapkv", "streamingllm", "h2o"}
         if method not in supported_methods:
@@ -489,12 +595,14 @@ class LLMChat(LLM):
                 f"Unsupported compression method: {self.compress_method}. "
                 f"Supported methods: {sorted(supported_methods)}."
             )
-        if self.compress_budget <= 0:
+        if self.compress_mode and self.compress_budget <= 0:
             raise ValueError(f"compress_budget must be > 0, got {self.compress_budget}.")
-        if self.compress_divide_length <= 0:
+        if self.compress_mode and self.compress_divide_length <= 0:
             raise ValueError(
                 f"compress_divide_length must be > 0, got {self.compress_divide_length}."
             )
+        if self.attn_heatmap_mode and self.attn_heatmap_layer is None:
+            raise ValueError("attn_heatmap_layer must be set when attn_heatmap_mode is enabled.")
         return {
             "method": method,
             "method_config": {
@@ -506,11 +614,14 @@ class LLMChat(LLM):
                 "retain_direction": "last",
                 "first_tokens": 4,
             },
+            "kvcomm_compress_mode": self.compress_mode,
             "update_kv": True,
             "compression": None,
             "compression_content": "all",
             "divide_method": "step_length",
             "divide_length": self.compress_divide_length,
+            "attn_heatmap_mode": self.attn_heatmap_mode,
+            "attn_heatmap_layer": self.attn_heatmap_layer,
         }
 
     def _resolve_torch_dtype(self) -> Union[torch.dtype, str]:
@@ -538,14 +649,21 @@ class LLMChat(LLM):
             if LLMChat._shared_model is None:
                 kvcomm_patched = False
                 resolved_dtype = self._resolve_torch_dtype()
-                if self.compress_mode:
-                    model_name_lower = self.model_name.lower()
+                patch_requested = bool(self.compress_mode or self.attn_heatmap_mode)
+                model_name_lower = self.model_name.lower()
+                if patch_requested:
+                    patch_config = self._build_patch_config()
                     if "llama" in model_name_lower:
-                        replace_llama(self._build_compression_config())
+                        replace_llama(patch_config)
                         kvcomm_patched = True
                     elif "qwen" in model_name_lower:
-                        replace_qwen2(self._build_compression_config())
+                        replace_qwen2(patch_config)
                         kvcomm_patched = True
+                    elif self.attn_heatmap_mode:
+                        raise ValueError(
+                            "Attention heatmap mode is only supported for llama/qwen models. "
+                            f"Requested model={self.model_name}."
+                        )
                     else:
                         logger.warning(
                             "Compression mode is only patched for llama/qwen models. "
@@ -553,17 +671,31 @@ class LLMChat(LLM):
                             self.model_name,
                         )
                 LLMChat._shared_tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                model_load_kwargs: Dict[str, Any] = {
+                    "torch_dtype": resolved_dtype,
+                    "low_cpu_mem_usage": True,
+                    "device_map": "auto",
+                    "trust_remote_code": True,
+                }
+                if self.attn_heatmap_mode:
+                    model_load_kwargs["attn_implementation"] = "eager"
                 LLMChat._shared_model = AutoModelForCausalLM.from_pretrained(
                     self.model_name,
-                    torch_dtype=resolved_dtype,
-                    low_cpu_mem_usage=True,
-                    device_map="auto",
-                    trust_remote_code=True,
+                    **model_load_kwargs,
                 )
+                if self.attn_heatmap_mode:
+                    num_layers = getattr(LLMChat._shared_model.config, "num_hidden_layers", None)
+                    if num_layers is not None and not (0 <= int(self.attn_heatmap_layer) < int(num_layers)):
+                        raise ValueError(
+                            f"attn_heatmap_layer must be in [0, {int(num_layers) - 1}], "
+                            f"got {self.attn_heatmap_layer}."
+                        )
                 LLMChat._shared_compress_mode = self.compress_mode
                 LLMChat._shared_compress_method = self.compress_method
                 LLMChat._shared_compress_budget = self.compress_budget
                 LLMChat._shared_compress_divide_length = self.compress_divide_length
+                LLMChat._shared_attn_heatmap_mode = self.attn_heatmap_mode
+                LLMChat._shared_attn_heatmap_layer = self.attn_heatmap_layer
                 LLMChat._shared_kvcomm_patched = kvcomm_patched
                 LLMChat._shared_model_dtype = self.model_dtype
                 logger.info(
@@ -577,6 +709,16 @@ class LLMChat(LLM):
                     LLMChat._shared_model_dtype,
                     self.model_dtype,
                 )
+            elif self.attn_heatmap_mode != bool(LLMChat._shared_attn_heatmap_mode):
+                raise ValueError(
+                    "Model already loaded with a different attention heatmap mode setting. "
+                    "Restart the process to change this option."
+                )
+            elif self.attn_heatmap_mode and self.attn_heatmap_layer != LLMChat._shared_attn_heatmap_layer:
+                raise ValueError(
+                    "Model already loaded with a different attention heatmap layer. "
+                    "Restart the process to change this option."
+                )
 
     def __getstate__(self):
         state = self.__dict__.copy()
@@ -589,7 +731,11 @@ class LLMChat(LLM):
         self.__dict__.update(state)
         if not hasattr(self, "_kvcomm_enabled"):
             self._kvcomm_enabled = bool(
-                getattr(self, "compress_mode", False) and LLMChat._shared_kvcomm_patched
+                (
+                    getattr(self, "compress_mode", False)
+                    or getattr(self, "attn_heatmap_mode", False)
+                )
+                and LLMChat._shared_kvcomm_patched
             )
         if not hasattr(self, "_kvcomm_call_seq"):
             self._kvcomm_call_seq = 0 if self._kvcomm_enabled else None

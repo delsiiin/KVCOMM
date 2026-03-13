@@ -21,6 +21,10 @@ class FinalWriteCode(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        attn_heatmap_mode: bool = False,
+        attn_heatmap_layer: int | None = None,
+        attn_heatmap_output_dir: str | None = None,
+        attn_heatmap_run_tag: str | None = None,
         model_dtype: str = "float16",
     ):
         super().__init__(id, "FinalWriteCode" ,domain, llm_name)
@@ -33,6 +37,10 @@ class FinalWriteCode(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            attn_heatmap_mode=attn_heatmap_mode,
+            attn_heatmap_layer=attn_heatmap_layer,
+            attn_heatmap_output_dir=attn_heatmap_output_dir,
+            attn_heatmap_run_tag=attn_heatmap_run_tag,
             model_dtype=model_dtype,
         )
         self.role = 'FinalWriteCode'
@@ -218,6 +226,7 @@ class FinalWriteCode(Node):
             agent_id=self.id,
             agent_name=self.agent_name,
             agent_role=self.role,
+            round_index=input.get("_round_index"),
         )
         return result
 
@@ -235,6 +244,10 @@ class FinalRefer(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        attn_heatmap_mode: bool = False,
+        attn_heatmap_layer: int | None = None,
+        attn_heatmap_output_dir: str | None = None,
+        attn_heatmap_run_tag: str | None = None,
         model_dtype: str = "float16",
     ):
         super().__init__(id, "FinalRefer" ,domain, llm_name)
@@ -247,6 +260,10 @@ class FinalRefer(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            attn_heatmap_mode=attn_heatmap_mode,
+            attn_heatmap_layer=attn_heatmap_layer,
+            attn_heatmap_output_dir=attn_heatmap_output_dir,
+            attn_heatmap_run_tag=attn_heatmap_run_tag,
             model_dtype=model_dtype,
         )
         self.role = 'FinalRefer'
@@ -378,6 +395,7 @@ class FinalRefer(Node):
             agent_id=self.id,
             agent_name=self.agent_name,
             agent_role=self.role,
+            round_index=input.get("_round_index"),
         )
         return result
 
@@ -393,6 +411,10 @@ class FinalDirect(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        attn_heatmap_mode: bool = False,
+        attn_heatmap_layer: int | None = None,
+        attn_heatmap_output_dir: str | None = None,
+        attn_heatmap_run_tag: str | None = None,
         model_dtype: str = "float16",
     ):
         """ Used for Directed IO """
@@ -439,6 +461,10 @@ class FinalMajorVote(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        attn_heatmap_mode: bool = False,
+        attn_heatmap_layer: int | None = None,
+        attn_heatmap_output_dir: str | None = None,
+        attn_heatmap_run_tag: str | None = None,
         model_dtype: str = "float16",
     ):
         """ Used for Directed IO """

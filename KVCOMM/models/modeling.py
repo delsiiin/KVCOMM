@@ -39,6 +39,34 @@ KV_COMPRESSION_MAP = {
 
 logger = logging.get_logger(__name__)
 
+
+def _capture_prefill_attention_heatmap(
+    *,
+    config,
+    layer_idx: int,
+    is_prefill: bool,
+    heatmap_capture: Optional[dict],
+    attn_weights: Optional[torch.Tensor],
+) -> None:
+    """Store one prefill attention heatmap matrix for the selected layer."""
+    if not getattr(config, "attn_heatmap_mode", False):
+        return
+    if not is_prefill or heatmap_capture is None or attn_weights is None:
+        return
+    if heatmap_capture.get("captured"):
+        return
+    target_layer = getattr(config, "attn_heatmap_layer", None)
+    if target_layer is None or int(target_layer) != int(layer_idx):
+        return
+    if attn_weights.ndim != 4 or attn_weights.shape[0] == 0:
+        return
+
+    heatmap_capture["captured"] = True
+    heatmap_capture["layer_idx"] = int(layer_idx)
+    heatmap_capture["matrix"] = (
+        attn_weights[0].mean(dim=0).detach().to(dtype=torch.float32).cpu()
+    )
+
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
     This is the equivalent of torch.repeat_interleave(x, dim=1, repeats=n_rep). The hidden states go from (batch,
@@ -51,7 +79,7 @@ def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     return hidden_states.reshape(batch, num_key_value_heads * n_rep, slen, head_dim)
 
 def LlamaAttention_init(
-    self, config: LlamaConfig, layer_idx: int, compression_config: dict
+    self, config: LlamaConfig, layer_idx: int, patch_config: dict
 ):
     nn.Module.__init__(self)
     self.config = config
@@ -94,10 +122,15 @@ def LlamaAttention_init(
     )
 
     # =============== New logic start ===============
-    self.config.update(compression_config)
-    self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
-        layer_idx=self.layer_idx, model_config=self.config, model_type="llama3", **compression_config["method_config"] 
-    )
+    self.config.update(patch_config)
+    self.kv_cluster = None
+    if getattr(self.config, "kvcomm_compress_mode", False):
+        self.kv_cluster = KV_COMPRESSION_MAP[patch_config["method"]](
+            layer_idx=self.layer_idx,
+            model_config=self.config,
+            model_type="llama3",
+            **patch_config["method_config"],
+        )
     # =============== New logic end =================
 
 def LlamaAttention_forward(
@@ -111,7 +144,10 @@ def LlamaAttention_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     kvcomm_should_compress = kwargs.pop("kvcomm_should_compress", None)
     kvcomm_state_key = kwargs.pop("kvcomm_state_key", None)
-    if kvcomm_should_compress is None:
+    kvcomm_is_prefill = kwargs.pop("kvcomm_is_prefill", False)
+    kvcomm_heatmap_capture = kwargs.pop("kvcomm_heatmap_capture", None)
+    compression_enabled = bool(getattr(self.config, "kvcomm_compress_mode", False))
+    if compression_enabled and kvcomm_should_compress is None:
         kvcomm_should_compress = self.config.compression
 
     input_shape = hidden_states.shape[:-1]
@@ -127,81 +163,86 @@ def LlamaAttention_forward(
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
-        # =============== Enable Query Cache ============
-        if not hasattr(past_key_value, "query_cache"):
-            past_key_value.query_cache = {}
+        if compression_enabled:
+            # =============== Enable Query Cache ============
+            if not hasattr(past_key_value, "query_cache"):
+                past_key_value.query_cache = {}
 
-        if self.layer_idx not in past_key_value.query_cache:
-            # prefill stage
-            bsz, n_heads, _, head_dim = query_states.shape
-            past_key_value.query_cache[self.layer_idx] = torch.empty(
-                bsz, n_heads, 0, head_dim
-            )
-            past_key_value.query_cache[self.layer_idx] = query_states[
-                :, :, -self.config.method_config["window_size"] :, :
-            ]
-        else:
-            # Add current query to cache
-            past_key_value.query_cache[self.layer_idx] = torch.cat(
-                (past_key_value.query_cache[self.layer_idx], query_states), dim=2
-            )  # [batch, n_q_heads, seq_len, head_dim]
-
-            # Keep only window_size most recent queries
-            window_size = self.config.method_config["window_size"]
-            if past_key_value.query_cache[self.layer_idx].shape[-2] > window_size:
-                past_key_value.query_cache[self.layer_idx] = past_key_value.query_cache[
-                    self.layer_idx
-                ][:, :, -window_size:, :]
-        # =============== Enable Query Cache end =========
-
-        # =============== decoding-time compression start ===============
-        cached_queries = past_key_value.query_cache[self.layer_idx]
-        if kvcomm_should_compress is None:
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-                state_key=kvcomm_state_key,
-            )
-
-            if self.config.update_kv is True:
-                past_key_value.update(
-                    key_states_compress,
-                    value_states_compress,
-                    self.layer_idx,
-                    cache_kwargs,
+            if self.layer_idx not in past_key_value.query_cache:
+                # prefill stage
+                bsz, n_heads, _, head_dim = query_states.shape
+                past_key_value.query_cache[self.layer_idx] = torch.empty(
+                    bsz, n_heads, 0, head_dim
                 )
+                past_key_value.query_cache[self.layer_idx] = query_states[
+                    :, :, -self.config.method_config["window_size"] :, :
+                ]
             else:
-                past_key_value.update(
+                # Add current query to cache
+                past_key_value.query_cache[self.layer_idx] = torch.cat(
+                    (past_key_value.query_cache[self.layer_idx], query_states), dim=2
+                )  # [batch, n_q_heads, seq_len, head_dim]
+
+                # Keep only window_size most recent queries
+                window_size = self.config.method_config["window_size"]
+                if past_key_value.query_cache[self.layer_idx].shape[-2] > window_size:
+                    past_key_value.query_cache[self.layer_idx] = past_key_value.query_cache[
+                        self.layer_idx
+                    ][:, :, -window_size:, :]
+            # =============== Enable Query Cache end =========
+
+            # =============== decoding-time compression start ===============
+            cached_queries = past_key_value.query_cache[self.layer_idx]
+            if kvcomm_should_compress is None:
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,  # Use cached queries instead of current query
+                    value_states,
+                    state_key=kvcomm_state_key,
+                )
+
+                if self.config.update_kv is True:
+                    past_key_value.update(
+                        key_states_compress,
+                        value_states_compress,
+                        self.layer_idx,
+                        cache_kwargs,
+                    )
+                else:
+                    past_key_value.update(
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                        cache_kwargs,
+                    )
+
+            elif kvcomm_should_compress is True:
+                key_states, value_states = past_key_value.update(
                     key_states,
                     value_states,
                     self.layer_idx,
                     cache_kwargs,
                 )
 
-        elif kvcomm_should_compress is True:
-            key_states, value_states = past_key_value.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-                cache_kwargs,
-            )
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,  # Use cached queries instead of current query
+                    value_states,
+                    state_key=kvcomm_state_key,
+                )
 
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-                state_key=kvcomm_state_key,
-            )
-
-            if self.config.update_kv is True:
-                past_key_value.key_cache[self.layer_idx] = key_states_compress
-                past_key_value.value_cache[self.layer_idx] = value_states_compress
+                if self.config.update_kv is True:
+                    past_key_value.key_cache[self.layer_idx] = key_states_compress
+                    past_key_value.value_cache[self.layer_idx] = value_states_compress
+            else:
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            # =============== decoding-time compression end ===============
         else:
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
-        # =============== decoding-time compression end ===============
 
     attention_interface: Callable = eager_attention_forward
     if self.config._attn_implementation != "eager":
@@ -227,12 +268,19 @@ def LlamaAttention_forward(
         scaling=self.scaling,
         **kwargs,
     )
+    _capture_prefill_attention_heatmap(
+        config=self.config,
+        layer_idx=self.layer_idx,
+        is_prefill=bool(kvcomm_is_prefill),
+        heatmap_capture=kvcomm_heatmap_capture,
+        attn_weights=attn_weights,
+    )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
     attn_output = self.o_proj(attn_output)
     return attn_output, attn_weights
 def Qwen2Attention_init(
-    self, config: Qwen2Config, layer_idx: int, compression_config: dict
+    self, config: Qwen2Config, layer_idx: int, patch_config: dict
 ):
     nn.Module.__init__(self)
     self.config = config
@@ -264,10 +312,15 @@ def Qwen2Attention_init(
     )
 
     # =============== New logic start ===============
-    self.config.update(compression_config)
-    self.kv_cluster = KV_COMPRESSION_MAP[compression_config["method"]](
-        layer_idx=self.layer_idx, model_config=self.config, model_type="qwen2", **compression_config["method_config"] 
-    )
+    self.config.update(patch_config)
+    self.kv_cluster = None
+    if getattr(self.config, "kvcomm_compress_mode", False):
+        self.kv_cluster = KV_COMPRESSION_MAP[patch_config["method"]](
+            layer_idx=self.layer_idx,
+            model_config=self.config,
+            model_type="qwen2",
+            **patch_config["method_config"],
+        )
     # =============== New logic end =================
 
 
@@ -282,7 +335,10 @@ def Qwen2Attention_forward(
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
     kvcomm_should_compress = kwargs.pop("kvcomm_should_compress", None)
     kvcomm_state_key = kwargs.pop("kvcomm_state_key", None)
-    if kvcomm_should_compress is None:
+    kvcomm_is_prefill = kwargs.pop("kvcomm_is_prefill", False)
+    kvcomm_heatmap_capture = kwargs.pop("kvcomm_heatmap_capture", None)
+    compression_enabled = bool(getattr(self.config, "kvcomm_compress_mode", False))
+    if compression_enabled and kvcomm_should_compress is None:
         kvcomm_should_compress = self.config.compression
 
     input_shape = hidden_states.shape[:-1]
@@ -298,80 +354,85 @@ def Qwen2Attention_forward(
     if past_key_value is not None:
         cache_kwargs = {"sin": sin, "cos": cos, "cache_position": cache_position}
 
-        # =============== Enable Query Cache ============
-        if not hasattr(past_key_value, "query_cache"):
-            past_key_value.query_cache = {}
+        if compression_enabled:
+            # =============== Enable Query Cache ============
+            if not hasattr(past_key_value, "query_cache"):
+                past_key_value.query_cache = {}
 
-        if self.layer_idx not in past_key_value.query_cache:
-            # prefill stage
-            bsz, n_heads, _, head_dim = query_states.shape
-            past_key_value.query_cache[self.layer_idx] = torch.empty(
-                bsz, n_heads, 0, head_dim
-            )
-            past_key_value.query_cache[self.layer_idx] = query_states[
-                :, :, -self.config.method_config["window_size"] :, :
-            ]
-        else:
-            # Add current query to cache
-            past_key_value.query_cache[self.layer_idx] = torch.cat(
-                (past_key_value.query_cache[self.layer_idx], query_states), dim=2
-            )  # [batch, n_q_heads, seq_len, head_dim]
-
-            # Keep only window_size most recent queries
-            window_size = self.config.method_config["window_size"]
-            if past_key_value.query_cache[self.layer_idx].shape[-2] > window_size:
-                past_key_value.query_cache[self.layer_idx] = past_key_value.query_cache[
-                    self.layer_idx
-                ][:, :, -window_size:, :]
-        # =============== Enable Query Cache end ===============
-
-        # =============== decoding-time compression start ===============
-        cached_queries = past_key_value.query_cache[self.layer_idx]
-        if kvcomm_should_compress is None:
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-                state_key=kvcomm_state_key,
-            )
-
-            if self.config.update_kv is True:
-                past_key_value.update(
-                    key_states_compress,
-                    value_states_compress,
-                    self.layer_idx,
-                    cache_kwargs,
+            if self.layer_idx not in past_key_value.query_cache:
+                # prefill stage
+                bsz, n_heads, _, head_dim = query_states.shape
+                past_key_value.query_cache[self.layer_idx] = torch.empty(
+                    bsz, n_heads, 0, head_dim
                 )
+                past_key_value.query_cache[self.layer_idx] = query_states[
+                    :, :, -self.config.method_config["window_size"] :, :
+                ]
             else:
-                past_key_value.update(
+                # Add current query to cache
+                past_key_value.query_cache[self.layer_idx] = torch.cat(
+                    (past_key_value.query_cache[self.layer_idx], query_states), dim=2
+                )  # [batch, n_q_heads, seq_len, head_dim]
+
+                # Keep only window_size most recent queries
+                window_size = self.config.method_config["window_size"]
+                if past_key_value.query_cache[self.layer_idx].shape[-2] > window_size:
+                    past_key_value.query_cache[self.layer_idx] = past_key_value.query_cache[
+                        self.layer_idx
+                    ][:, :, -window_size:, :]
+            # =============== Enable Query Cache end ===============
+
+            # =============== decoding-time compression start ===============
+            cached_queries = past_key_value.query_cache[self.layer_idx]
+            if kvcomm_should_compress is None:
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,  # Use cached queries instead of current query
+                    value_states,
+                    state_key=kvcomm_state_key,
+                )
+
+                if self.config.update_kv is True:
+                    past_key_value.update(
+                        key_states_compress,
+                        value_states_compress,
+                        self.layer_idx,
+                        cache_kwargs,
+                    )
+                else:
+                    past_key_value.update(
+                        key_states,
+                        value_states,
+                        self.layer_idx,
+                        cache_kwargs,
+                    )
+
+            elif kvcomm_should_compress is True:
+                key_states, value_states = past_key_value.update(
                     key_states,
                     value_states,
                     self.layer_idx,
                     cache_kwargs,
                 )
 
-        elif kvcomm_should_compress is True:
-            key_states, value_states = past_key_value.update(
-                key_states,
-                value_states,
-                self.layer_idx,
-                cache_kwargs,
-            )
-
-            key_states_compress, value_states_compress = self.kv_cluster.update_kv(
-                key_states,
-                cached_queries,  # Use cached queries instead of current query
-                value_states,
-                state_key=kvcomm_state_key,
-            )
-            if self.config.update_kv is True:
-                past_key_value.key_cache[self.layer_idx] = key_states_compress
-                past_key_value.value_cache[self.layer_idx] = value_states_compress
+                key_states_compress, value_states_compress = self.kv_cluster.update_kv(
+                    key_states,
+                    cached_queries,  # Use cached queries instead of current query
+                    value_states,
+                    state_key=kvcomm_state_key,
+                )
+                if self.config.update_kv is True:
+                    past_key_value.key_cache[self.layer_idx] = key_states_compress
+                    past_key_value.value_cache[self.layer_idx] = value_states_compress
+            else:
+                key_states, value_states = past_key_value.update(
+                    key_states, value_states, self.layer_idx, cache_kwargs
+                )
+            # =============== decoding-time compression end ===============
         else:
             key_states, value_states = past_key_value.update(
                 key_states, value_states, self.layer_idx, cache_kwargs
             )
-        # =============== decoding-time compression end ===============
 
     sliding_window = None
     if (
@@ -405,6 +466,13 @@ def Qwen2Attention_forward(
         scaling=self.scaling,
         sliding_window=sliding_window,  # main diff with Llama
         **kwargs,
+    )
+    _capture_prefill_attention_heatmap(
+        config=self.config,
+        layer_idx=self.layer_idx,
+        is_prefill=bool(kvcomm_is_prefill),
+        heatmap_capture=kvcomm_heatmap_capture,
+        attn_weights=attn_weights,
     )
 
     attn_output = attn_output.reshape(*input_shape, -1).contiguous()
@@ -447,6 +515,8 @@ def CausalLM_forward(
 
     if not hasattr(self, "_kvcomm_seq_states"):
         self._kvcomm_seq_states = {}
+    if not hasattr(self, "_kvcomm_heatmap_captures"):
+        self._kvcomm_heatmap_captures = {}
     state_key = kvcomm_state_key or "__default__"
     if state_key not in self._kvcomm_seq_states:
         self._kvcomm_seq_states[state_key] = {
@@ -476,10 +546,19 @@ def CausalLM_forward(
         if self.config.compression_content == "think":
             seq_state["after_think"] = False
         seq_state["next_compression"] = None
+        if getattr(self.config, "attn_heatmap_mode", False):
+            self._kvcomm_heatmap_captures[state_key] = {
+                "captured": False,
+                "layer_idx": getattr(self.config, "attn_heatmap_layer", None),
+                "matrix": None,
+            }
     else:
         seq_state["length"] += input_len
 
     kvcomm_should_compress = seq_state.get("next_compression", None)
+    heatmap_capture = self._kvcomm_heatmap_captures.get(state_key)
+    if getattr(self.config, "attn_heatmap_mode", False):
+        output_attentions = True
 
     # decoder outputs consists of (dec_features, layer_state, dec_hidden, dec_attn)
     outputs = self.model(
@@ -495,6 +574,8 @@ def CausalLM_forward(
         cache_position=cache_position,
         kvcomm_state_key=state_key,
         kvcomm_should_compress=kvcomm_should_compress,
+        kvcomm_is_prefill=is_prefill,
+        kvcomm_heatmap_capture=heatmap_capture,
         **kwargs,
     )
 

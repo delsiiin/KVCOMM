@@ -17,6 +17,7 @@ from KVCOMM.llm.config import KVCommConfig
 from datasets.MMLU.download import download
 from datasets.mmlu_dataset import MMLUDataset
 from experiments.evaluate_mmlu import evaluate
+from KVCOMM.utils.attention_heatmap import build_heatmap_tag
 from KVCOMM.utils.log import configure_logging, logger
 from KVCOMM.utils.metrics import metrics_recorder
 
@@ -34,6 +35,18 @@ def build_compression_tag(compress_mode: bool, compress_method: str, compress_bu
         return "no-compress"
     safe_method = (compress_method or "unknown").strip().replace("/", "-").replace(" ", "-")
     return f"compress-{safe_method}-b{int(compress_budget)}"
+
+
+def build_runtime_tag(
+    compress_mode: bool,
+    compress_method: str,
+    compress_budget: int,
+    attn_heatmap_mode: bool,
+    attn_heatmap_layer: int | None,
+) -> str:
+    compression_tag = build_compression_tag(compress_mode, compress_method, compress_budget)
+    heatmap_tag = build_heatmap_tag(attn_heatmap_mode, attn_heatmap_layer)
+    return f"{compression_tag}_{heatmap_tag}"
 
 
 def parse_args():
@@ -70,6 +83,8 @@ def parse_args():
     parser.add_argument("--compress-method", type=str, default="rkv", help="Compression method: rkv/snapkv/streamingllm/h2o.")
     parser.add_argument("--compress-budget", type=int, default=1024, help="Compression KV budget.")
     parser.add_argument("--compress-divide-length", type=int, default=128, help="Compression divide length.")
+    parser.add_argument("--attn-heatmap-mode", dest="attn_heatmap_mode", action="store_true", default=False, help="Enable prefill attention heatmap export.")
+    parser.add_argument("--attn-heatmap-layer", type=int, default=None, help="Layer index used for prefill attention heatmap export.")
     parser.add_argument("--model-dtype", type=str, default="float16", help="Model load dtype: float16/bfloat16/float32/auto.")
     parser.add_argument("--plot-length-hist", dest="plot_length_hist", action="store_true", default=False, help="Plot per-agent input/output length histograms.")
 
@@ -85,8 +100,16 @@ async def main():
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    compression_tag = build_compression_tag(args.compress_mode, args.compress_method, args.compress_budget)
+    timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+    runtime_tag = build_runtime_tag(
+        args.compress_mode,
+        args.compress_method,
+        args.compress_budget,
+        args.attn_heatmap_mode,
+        args.attn_heatmap_layer,
+    )
     safe_llm_name = args.llm_name.replace("/", "-")
+    run_tag = f"{args.domain}_{safe_llm_name}_{runtime_tag}_{timestamp}"
     metrics_recorder.reset()
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
@@ -108,6 +131,10 @@ async def main():
         compress_method=args.compress_method,
         compress_budget=args.compress_budget,
         compress_divide_length=args.compress_divide_length,
+        attn_heatmap_mode=args.attn_heatmap_mode,
+        attn_heatmap_layer=args.attn_heatmap_layer,
+        attn_heatmap_output_dir=str(output_dir / "attn_heatmaps"),
+        attn_heatmap_run_tag=run_tag,
         model_dtype=args.model_dtype,
         **kwargs,
     )
@@ -115,15 +142,13 @@ async def main():
     download()
     dataset_val = MMLUDataset("val")
     limit_questions = 153
-    configure_logging(log_path=output_dir / "logs" / f"log_{compression_tag}.txt")
-    timestamp = time.strftime("%Y-%m-%d-%H-%M-%S", time.localtime())
+    configure_logging(log_path=output_dir / "logs" / f"log_{runtime_tag}.txt")
     score = await evaluate(
         graph=graph,
         dataset=dataset_val,
         limit_questions=limit_questions,
         eval_batch_size=args.batch_size,
     )
-    run_tag = f"{args.domain}_{safe_llm_name}_{compression_tag}_{timestamp}"
     length_artifacts = metrics_recorder.export_agent_length_artifacts(
         output_dir=output_dir / "length_stats",
         run_tag=run_tag,
@@ -135,7 +160,7 @@ async def main():
         plot_hist=args.plot_length_hist,
     )
     logger.opt(colors=True).info("<blue>[MMLU SCORE]</blue> {:.4f}", score)
-    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{compression_tag}_{timestamp}.json"
+    result_file = output_dir / f"{args.domain}_{safe_llm_name}_{runtime_tag}_{timestamp}.json"
     result_file.touch(exist_ok=True)
     payload = {
         "score": score,

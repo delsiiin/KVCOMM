@@ -54,6 +54,10 @@ class Graph(ABC):
                 compress_method: str = "rkv",
                 compress_budget: int = 1024,
                 compress_divide_length: int = 128,
+                attn_heatmap_mode: bool = False,
+                attn_heatmap_layer: Optional[int] = None,
+                attn_heatmap_output_dir: Optional[str] = None,
+                attn_heatmap_run_tag: Optional[str] = None,
                 model_dtype: str = "float16",
                 ):
 
@@ -75,6 +79,12 @@ class Graph(ABC):
         self.compress_method = (compress_method or "rkv").lower().strip()
         self.compress_budget = int(compress_budget)
         self.compress_divide_length = int(compress_divide_length)
+        self.attn_heatmap_mode = bool(attn_heatmap_mode)
+        self.attn_heatmap_layer = (
+            int(attn_heatmap_layer) if attn_heatmap_layer is not None else None
+        )
+        self.attn_heatmap_output_dir = attn_heatmap_output_dir
+        self.attn_heatmap_run_tag = attn_heatmap_run_tag
         self.model_dtype = (model_dtype or "float16").lower().strip()
         self.decision_node:Node = AgentRegistry.get(
             decision_method,
@@ -86,6 +96,10 @@ class Graph(ABC):
                 "compress_method": self.compress_method,
                 "compress_budget": self.compress_budget,
                 "compress_divide_length": self.compress_divide_length,
+                "attn_heatmap_mode": self.attn_heatmap_mode,
+                "attn_heatmap_layer": self.attn_heatmap_layer,
+                "attn_heatmap_output_dir": self.attn_heatmap_output_dir,
+                "attn_heatmap_run_tag": self.attn_heatmap_run_tag,
                 "model_dtype": self.model_dtype,
             },
         ) if decision_method is not None else None
@@ -99,6 +113,10 @@ class Graph(ABC):
             kwargs.setdefault("compress_method", self.compress_method)
             kwargs.setdefault("compress_budget", self.compress_budget)
             kwargs.setdefault("compress_divide_length", self.compress_divide_length)
+            kwargs.setdefault("attn_heatmap_mode", self.attn_heatmap_mode)
+            kwargs.setdefault("attn_heatmap_layer", self.attn_heatmap_layer)
+            kwargs.setdefault("attn_heatmap_output_dir", self.attn_heatmap_output_dir)
+            kwargs.setdefault("attn_heatmap_run_tag", self.attn_heatmap_run_tag)
             kwargs.setdefault("model_dtype", self.model_dtype)
 
         self.init_nodes()                              
