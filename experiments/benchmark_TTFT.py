@@ -74,6 +74,7 @@ def parse_args():
     parser.add_argument("--compress-budget", type=int, default=1024, help="Compression KV budget.")
     parser.add_argument("--compress-divide-length", type=int, default=128, help="Compression divide length.")
     parser.add_argument("--model-dtype", type=str, default="float16", help="Model load dtype: float16/bfloat16/float32/auto.")
+    parser.add_argument("--num_rounds", type=int, default=1, help="Number of graph execution rounds for each arun call.")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
@@ -93,6 +94,7 @@ async def evaluate(
         samples: int,
         output_dir: str,
         compression_tag: str,
+        num_rounds: int,
         ) -> List[Dict[str, Any]]:
 
     graph.spatial_logits.requires_grad_ = False
@@ -107,7 +109,11 @@ async def evaluate(
         realized_graph = copy.deepcopy(graph)
         realized_graph.spatial_logits = graph.spatial_logits
         realized_graph.temporal_logits = graph.temporal_logits
-        tasks = [asyncio.create_task(realized_graph.arun(input_dict))]
+        tasks = [
+            asyncio.create_task(
+                realized_graph.arun(input_dict, num_rounds=num_rounds)
+            )
+        ]
         raw_results = await asyncio.gather(*tasks)
         all_results.extend(raw_results)
     print("Done!")
@@ -182,6 +188,7 @@ async def main():
         samples=args.samples,
         output_dir=str(output_dir),
         compression_tag=compression_tag,
+        num_rounds=args.num_rounds,
     )
 
 

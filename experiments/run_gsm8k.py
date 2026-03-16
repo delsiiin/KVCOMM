@@ -112,6 +112,7 @@ def parse_args():
     parser.add_argument("--attn-heatmap-layer", type=int, default=None, help="Layer index used for prefill attention heatmap export.")
     parser.add_argument("--model-dtype", type=str, default="float16", help="Model load dtype: float16/bfloat16/float32/auto.")
     parser.add_argument("--plot-length-hist", dest="plot_length_hist", action="store_true", default=False, help="Plot per-agent input/output length histograms.")
+    parser.add_argument("--num_rounds", type=int, default=1, help="Number of graph execution rounds for each arun call.")
     args = parser.parse_args()
 
     if len(args.agent_names) != len(args.agent_nums):
@@ -194,7 +195,7 @@ async def main():
                 asyncio.create_task(
                     realized_graph.arun(
                         input_dict,
-                        1,
+                        num_rounds=args.num_rounds,
                     )
                 )
             )

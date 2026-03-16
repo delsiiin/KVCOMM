@@ -19,6 +19,7 @@ async def evaluate(
     dataset,
     limit_questions: Optional[int] = None,
     eval_batch_size: int = 1,
+    num_rounds: int = 1,
 ) -> float:
     """Evaluate a graph on the provided dataset."""
     logger.info(
@@ -62,7 +63,7 @@ async def evaluate(
                 asyncio.create_task(
                     realized_graph.arun(
                         input_dict,
-                        1,
+                        num_rounds=num_rounds,
                     )
                 )
             )
