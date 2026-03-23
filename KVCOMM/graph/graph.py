@@ -54,6 +54,11 @@ class Graph(ABC):
                 compress_method: str = "rkv",
                 compress_budget: int = 1024,
                 compress_divide_length: int = 128,
+                flowkv_mode: bool = False,
+                flowkv_segment_granularity: str = "per_agent",
+                flowkv_budget_bias: str = "history_first",
+                flowkv_core_reserve: int = 128,
+                flowkv_min_agent_budget: int = 32,
                 attn_heatmap_mode: bool = False,
                 attn_heatmap_layer: Optional[int] = None,
                 attn_heatmap_output_dir: Optional[str] = None,
@@ -79,6 +84,13 @@ class Graph(ABC):
         self.compress_method = (compress_method or "rkv").lower().strip()
         self.compress_budget = int(compress_budget)
         self.compress_divide_length = int(compress_divide_length)
+        self.flowkv_mode = bool(flowkv_mode)
+        self.flowkv_segment_granularity = (
+            flowkv_segment_granularity or "per_agent"
+        ).lower().strip()
+        self.flowkv_budget_bias = (flowkv_budget_bias or "history_first").lower().strip()
+        self.flowkv_core_reserve = int(flowkv_core_reserve)
+        self.flowkv_min_agent_budget = int(flowkv_min_agent_budget)
         self.attn_heatmap_mode = bool(attn_heatmap_mode)
         self.attn_heatmap_layer = (
             int(attn_heatmap_layer) if attn_heatmap_layer is not None else None
@@ -96,6 +108,11 @@ class Graph(ABC):
                 "compress_method": self.compress_method,
                 "compress_budget": self.compress_budget,
                 "compress_divide_length": self.compress_divide_length,
+                "flowkv_mode": self.flowkv_mode,
+                "flowkv_segment_granularity": self.flowkv_segment_granularity,
+                "flowkv_budget_bias": self.flowkv_budget_bias,
+                "flowkv_core_reserve": self.flowkv_core_reserve,
+                "flowkv_min_agent_budget": self.flowkv_min_agent_budget,
                 "attn_heatmap_mode": self.attn_heatmap_mode,
                 "attn_heatmap_layer": self.attn_heatmap_layer,
                 "attn_heatmap_output_dir": self.attn_heatmap_output_dir,
@@ -113,6 +130,11 @@ class Graph(ABC):
             kwargs.setdefault("compress_method", self.compress_method)
             kwargs.setdefault("compress_budget", self.compress_budget)
             kwargs.setdefault("compress_divide_length", self.compress_divide_length)
+            kwargs.setdefault("flowkv_mode", self.flowkv_mode)
+            kwargs.setdefault("flowkv_segment_granularity", self.flowkv_segment_granularity)
+            kwargs.setdefault("flowkv_budget_bias", self.flowkv_budget_bias)
+            kwargs.setdefault("flowkv_core_reserve", self.flowkv_core_reserve)
+            kwargs.setdefault("flowkv_min_agent_budget", self.flowkv_min_agent_budget)
             kwargs.setdefault("attn_heatmap_mode", self.attn_heatmap_mode)
             kwargs.setdefault("attn_heatmap_layer", self.attn_heatmap_layer)
             kwargs.setdefault("attn_heatmap_output_dir", self.attn_heatmap_output_dir)

@@ -73,6 +73,11 @@ def parse_args():
     parser.add_argument("--compress-method", type=str, default="rkv", help="Compression method: rkv/snapkv/streamingllm/h2o.")
     parser.add_argument("--compress-budget", type=int, default=1024, help="Compression KV budget.")
     parser.add_argument("--compress-divide-length", type=int, default=128, help="Compression divide length.")
+    parser.add_argument("--flowkv-mode", dest="flowkv_mode", action="store_true", default=False, help="Enable FlowKV-style per-agent segment isolation.")
+    parser.add_argument("--flowkv-segment-granularity", type=str, default="per_agent", help="FlowKV segment granularity. Currently supports per_agent.")
+    parser.add_argument("--flowkv-budget-bias", type=str, default="history_first", help="FlowKV budget bias: history_first/length_ratio/current_first.")
+    parser.add_argument("--flowkv-core-reserve", type=int, default=128, help="Reserved token budget for FlowKV core segments.")
+    parser.add_argument("--flowkv-min-agent-budget", type=int, default=32, help="Minimum token budget reserved per historical agent segment.")
     parser.add_argument("--model-dtype", type=str, default="float16", help="Model load dtype: float16/bfloat16/float32/auto.")
     parser.add_argument("--num_rounds", type=int, default=1, help="Number of graph execution rounds for each arun call.")
 
@@ -178,6 +183,11 @@ async def main():
         compress_method=args.compress_method,
         compress_budget=args.compress_budget,
         compress_divide_length=args.compress_divide_length,
+        flowkv_mode=args.flowkv_mode,
+        flowkv_segment_granularity=args.flowkv_segment_granularity,
+        flowkv_budget_bias=args.flowkv_budget_bias,
+        flowkv_core_reserve=args.flowkv_core_reserve,
+        flowkv_min_agent_budget=args.flowkv_min_agent_budget,
         model_dtype=args.model_dtype,
         **kwargs,
     )

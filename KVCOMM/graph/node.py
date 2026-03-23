@@ -1,8 +1,9 @@
 import shortuuid
-from typing import List, Any, Optional,Dict
+from typing import List, Any, Optional,Dict, Iterable
 from abc import ABC, abstractmethod
 import asyncio
 
+from KVCOMM.llm.flowkv import PromptSegment
 from KVCOMM.utils.metrics import GenerationResult, metrics_recorder
 
 node_id_ = 0
@@ -240,6 +241,66 @@ class Node(ABC):
             round_index=input_data.get("_round_index"),
             metadata=metadata,
         )
+
+    def make_prompt_segment(
+        self,
+        *,
+        kind: str,
+        text: str,
+        agent_id: Optional[str] = None,
+        role: Optional[str] = None,
+        message_role: str = "user",
+    ) -> PromptSegment:
+        return PromptSegment(
+            kind=kind,
+            text=text,
+            agent_id=agent_id,
+            role=role,
+            message_role=message_role,
+        )
+
+    def build_prompt_payload(
+        self,
+        *,
+        system_prompt: str,
+        core_segments: Optional[Iterable[PromptSegment]] = None,
+        past_segments: Optional[Iterable[PromptSegment]] = None,
+        current_segments: Optional[Iterable[PromptSegment]] = None,
+    ) -> Dict[str, Any]:
+        ordered_segments: List[PromptSegment] = [
+            self.make_prompt_segment(
+                kind="core",
+                text=system_prompt,
+                role=getattr(self, "role", None),
+                message_role="system",
+            )
+        ]
+        for collection in (core_segments, past_segments, current_segments):
+            if collection is None:
+                continue
+            ordered_segments.extend(collection)
+
+        system_content = "".join(
+            segment.text for segment in ordered_segments if segment.message_role == "system"
+        )
+        user_content = "".join(
+            segment.text for segment in ordered_segments if segment.message_role == "user"
+        )
+        return {
+            "system_prompt": system_content,
+            "user_prompt": user_content,
+            "segments": ordered_segments,
+        }
+
+    def build_llm_messages(self, prompt_payload: Dict[str, Any]) -> Any:
+        messages = [
+            {"role": "system", "content": prompt_payload.get("system_prompt", "")},
+            {"role": "user", "content": prompt_payload.get("user_prompt", "")},
+        ]
+        segments = prompt_payload.get("segments")
+        if segments:
+            return {"messages": messages, "segments": segments}
+        return messages
 
     @abstractmethod
     def _execute(self, input:List[Any], spatial_info:Dict[str,Any], temporal_info:Dict[str,Any], **kwargs):

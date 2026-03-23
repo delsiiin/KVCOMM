@@ -22,6 +22,11 @@ class CodeWriting(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        flowkv_mode: bool = False,
+        flowkv_segment_granularity: str = "per_agent",
+        flowkv_budget_bias: str = "history_first",
+        flowkv_core_reserve: int = 128,
+        flowkv_min_agent_budget: int = 32,
         attn_heatmap_mode: bool = False,
         attn_heatmap_layer: int | None = None,
         attn_heatmap_output_dir: str | None = None,
@@ -38,6 +43,11 @@ class CodeWriting(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            flowkv_mode=flowkv_mode,
+            flowkv_segment_granularity=flowkv_segment_granularity,
+            flowkv_budget_bias=flowkv_budget_bias,
+            flowkv_core_reserve=flowkv_core_reserve,
+            flowkv_min_agent_budget=flowkv_min_agent_budget,
             attn_heatmap_mode=attn_heatmap_mode,
             attn_heatmap_layer=attn_heatmap_layer,
             attn_heatmap_output_dir=attn_heatmap_output_dir,
@@ -58,8 +68,8 @@ class CodeWriting(Node):
     )->Dict[str, Any]:
         """Prepare prompts in default mode."""
         system_prompt = self.constraint
-        spatial_str = ""
-        temporal_str = ""
+        current_segments = []
+        past_segments = []
         for id, info in spatial_info.items():
             if info['output'].startswith("```python") and info['output'].endswith("```") and self.role != 'Normal Programmer' and self.role != 'Stupid Programmer':
                 output = info['output'].split("```python\n")[-1].split("\n```")[0]
@@ -75,9 +85,26 @@ class CodeWriting(Node):
                         "peer_agent_role": info.get("role"),
                     },
                 )
-                spatial_str += f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n Whether it passes internal testing?\n{is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                current_segments.append(
+                    self.make_prompt_segment(
+                        kind="current",
+                        agent_id=id,
+                        role=info.get("role"),
+                        text=(
+                            f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n "
+                            f"Whether it passes internal testing?\n{is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                        ),
+                    )
+                )
             else:
-                spatial_str += f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n"
+                current_segments.append(
+                    self.make_prompt_segment(
+                        kind="current",
+                        agent_id=id,
+                        role=info.get("role"),
+                        text=f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n",
+                    )
+                )
         for id, info in temporal_info.items():
             if info['output'].startswith("```python") and info['output'].endswith("```") and self.role != 'Normal Programmer' and self.role != 'Stupid Programmer':
                 output = info['output'].split("```python\n")[-1].split("\n```")[0]
@@ -93,13 +120,55 @@ class CodeWriting(Node):
                         "peer_agent_role": info.get("role"),
                     },
                 )
-                temporal_str += f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n Whether it passes internal testing? {is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                past_segments.append(
+                    self.make_prompt_segment(
+                        kind="past",
+                        agent_id=id,
+                        role=info.get("role"),
+                        text=(
+                            f"Agent {id} as a {info['role']}:\n\nThe code written by the agent is:\n\n{info['output']}\n\n "
+                            f"Whether it passes internal testing? {is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                        ),
+                    )
+                )
             else:
-                temporal_str += f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n"
-        user_prompt = f"The task is:\n\n{raw_inputs['task']}\n"
-        user_prompt += f"At the same time, the outputs and feedbacks of other agents are as follows:\n\n{spatial_str} \n\n" if len(spatial_str) else ""
-        user_prompt += f"In the last round of dialogue, the outputs and feedbacks of some agents were: \n\n{temporal_str}" if len(temporal_str) else ""
-        return {"system_prompt": system_prompt, "user_prompt": user_prompt}
+                past_segments.append(
+                    self.make_prompt_segment(
+                        kind="past",
+                        agent_id=id,
+                        role=info.get("role"),
+                        text=f"Agent {id} as a {info['role']} provides the following info: {info['output']}\n\n",
+                    )
+                )
+        core_segments = [
+            self.make_prompt_segment(
+                kind="core",
+                text=f"The task is:\n\n{raw_inputs['task']}\n",
+            )
+        ]
+        if current_segments:
+            current_segments = [
+                self.make_prompt_segment(
+                    kind="core",
+                    text="At the same time, the outputs and feedbacks of other agents are as follows:\n\n",
+                ),
+                *current_segments,
+                self.make_prompt_segment(kind="core", text=" \n\n"),
+            ]
+        if past_segments:
+            past_segments = [
+                self.make_prompt_segment(
+                    kind="core",
+                    text="In the last round of dialogue, the outputs and feedbacks of some agents were: \n\n",
+                ),
+                *past_segments,
+            ]
+        return self.build_prompt_payload(
+            system_prompt=system_prompt,
+            core_segments=core_segments,
+            past_segments=past_segments,
+            current_segments=current_segments,
+        )
 
     def extract_example(self, prompt: str) -> list:
         prompt = prompt['task']
@@ -128,9 +197,7 @@ class CodeWriting(Node):
                 **kwargs,
             )
         )
-        system_prompt = inputs["system_prompt"]
-        user_prompt = inputs["user_prompt"]
-        message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
+        message = self.build_llm_messages(inputs)
         response = self.llm.gen(message)
         return response
 
@@ -158,7 +225,7 @@ class CodeWriting(Node):
                     "output_char_len": len(user_prompt),
                 },
             )
-        message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
+        message = self.build_llm_messages(inputs)
         result = await self.llm.agen(
             message,
             request_uid=request_uid,

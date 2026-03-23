@@ -16,6 +16,7 @@ from tenacity import retry, stop_after_attempt, wait_random_exponential
 from transformers import AutoModelForCausalLM, AutoTokenizer, StoppingCriteria, StoppingCriteriaList
 
 from KVCOMM.llm.config import KVCommConfig
+from KVCOMM.llm.flowkv import FlowKVContentPlan, PromptSegment, build_flowkv_content_plan
 from KVCOMM.llm.format import Message
 from KVCOMM.llm.llm import LLM
 from KVCOMM.llm.llm_registry import LLMRegistry
@@ -135,6 +136,11 @@ class LLMChat(LLM):
     _shared_compress_method: Optional[str] = None
     _shared_compress_budget: Optional[int] = None
     _shared_compress_divide_length: Optional[int] = None
+    _shared_flowkv_mode: Optional[bool] = None
+    _shared_flowkv_segment_granularity: Optional[str] = None
+    _shared_flowkv_budget_bias: Optional[str] = None
+    _shared_flowkv_core_reserve: Optional[int] = None
+    _shared_flowkv_min_agent_budget: Optional[int] = None
     _shared_attn_heatmap_mode: Optional[bool] = None
     _shared_attn_heatmap_layer: Optional[int] = None
     _shared_kvcomm_patched: Optional[bool] = None
@@ -150,6 +156,11 @@ class LLMChat(LLM):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        flowkv_mode: bool = False,
+        flowkv_segment_granularity: str = "per_agent",
+        flowkv_budget_bias: str = "history_first",
+        flowkv_core_reserve: int = 128,
+        flowkv_min_agent_budget: int = 32,
         attn_heatmap_mode: bool = False,
         attn_heatmap_layer: Optional[int] = None,
         attn_heatmap_output_dir: Optional[str] = None,
@@ -162,6 +173,13 @@ class LLMChat(LLM):
         self.compress_method = (compress_method or "rkv").lower().strip()
         self.compress_budget = int(compress_budget)
         self.compress_divide_length = int(compress_divide_length)
+        self.flowkv_mode = bool(flowkv_mode)
+        self.flowkv_segment_granularity = (
+            flowkv_segment_granularity or "per_agent"
+        ).lower().strip()
+        self.flowkv_budget_bias = (flowkv_budget_bias or "history_first").lower().strip()
+        self.flowkv_core_reserve = int(flowkv_core_reserve)
+        self.flowkv_min_agent_budget = int(flowkv_min_agent_budget)
         self.attn_heatmap_mode = bool(attn_heatmap_mode)
         self.attn_heatmap_layer = (
             int(attn_heatmap_layer) if attn_heatmap_layer is not None else None
@@ -301,12 +319,38 @@ class LLMChat(LLM):
             prompt_parts.append("[ASSISTANT]\n")
         return "".join(prompt_parts)
 
+    @staticmethod
+    def _extract_flowkv_segments(
+        messages: Union[List[Message], List[Dict[str, str]], Dict[str, Any], Tuple[Any, ...], str]
+    ) -> List[PromptSegment]:
+        if isinstance(messages, dict):
+            raw_segments = messages.get("segments")
+            if raw_segments is not None:
+                return [PromptSegment.from_any(segment) for segment in raw_segments]
+            conversation = messages.get("messages") or messages.get("conversation")
+            if conversation is not None:
+                return LLMChat._extract_flowkv_segments(conversation)
+            return []
+        if isinstance(messages, tuple):
+            return LLMChat._extract_flowkv_segments(list(messages))
+        if isinstance(messages, list):
+            segments: List[PromptSegment] = []
+            for item in messages:
+                if isinstance(item, dict) and item.get("flowkv_segments"):
+                    segments.extend(
+                        PromptSegment.from_any(segment)
+                        for segment in item.get("flowkv_segments", [])
+                    )
+            return segments
+        return []
+
     def _build_chat_inputs(
         self,
         messages: Union[List[Message], List[Dict[str, str]], str],
         assistant_prompt: Optional[str] = None,
         add_generation_prompt: bool = True,
-    ) -> Tuple[Dict[str, torch.Tensor], str, int]:
+    ) -> Tuple[Dict[str, torch.Tensor], str, int, Optional[FlowKVContentPlan]]:
+        flowkv_segments = self._extract_flowkv_segments(messages)
         normalised = self._normalise_messages(messages)
         assistant_prompt = assistant_prompt or self.default_assistant_prompt
         try:
@@ -325,7 +369,15 @@ class LLMChat(LLM):
             inputs = self.tokenizer(prompt_text, return_tensors="pt", add_special_tokens=False)
         inputs = {k: v.to(self.model.device) if isinstance(v, torch.Tensor) else v for k, v in inputs.items()}
         input_length = inputs["input_ids"].shape[-1]
-        return inputs, prompt_text, input_length
+        plan = None
+        if self.flowkv_mode and flowkv_segments:
+            plan = build_flowkv_content_plan(
+                tokenizer=self.tokenizer,
+                prompt_text=prompt_text,
+                segments=flowkv_segments,
+                prompt_token_length=input_length,
+            )
+        return inputs, prompt_text, input_length, plan
 
     def _render_base_messages(self, system_prompt: str, user_prompt: str) -> List[Dict[str, str]]:
         rendered: List[Dict[str, str]] = []
@@ -351,7 +403,7 @@ class LLMChat(LLM):
         return_messages: bool = False,
     ) -> Dict[str, Any]:
         messages = self._render_base_messages(system_prompt, user_prompt)
-        inputs, prompt_text, prompt_length = self._build_chat_inputs(
+        inputs, prompt_text, prompt_length, _ = self._build_chat_inputs(
             messages,
             assistant_prompt=assistant_prompt,
             add_generation_prompt=add_generation_prompt,
@@ -364,6 +416,19 @@ class LLMChat(LLM):
     def set_id(self, node_id: str, role: str):
         self.node_id = node_id
         self.role = role
+
+    def _register_flowkv_plan(
+        self,
+        state_key: Optional[str],
+        plan: Optional[FlowKVContentPlan],
+    ) -> None:
+        if not self.flowkv_mode or not state_key or plan is None:
+            return
+        store = getattr(self.model.config, "_flowkv_prompt_plans", None)
+        if not isinstance(store, dict):
+            store = {}
+            setattr(self.model.config, "_flowkv_prompt_plans", store)
+        store[state_key] = plan
 
     def _next_kvcomm_call_seq(self) -> int:
         if not self._kvcomm_enabled:
@@ -393,6 +458,9 @@ class LLMChat(LLM):
         heatmap_captures = getattr(self.model, "_kvcomm_heatmap_captures", None)
         if isinstance(heatmap_captures, dict):
             heatmap_captures.pop(state_key, None)
+        flowkv_plans = getattr(self.model.config, "_flowkv_prompt_plans", None)
+        if isinstance(flowkv_plans, dict):
+            flowkv_plans.pop(state_key, None)
 
     def _pop_attention_heatmap_capture(
         self, state_key: Optional[str]
@@ -459,7 +527,7 @@ class LLMChat(LLM):
             max_tokens = self.DEFAULT_MAX_TOKENS
         if temperature is None:
             temperature = self.DEFAULT_TEMPERATURE
-        inputs, _, prompt_length = self._build_chat_inputs(messages)
+        inputs, _, prompt_length, flowkv_plan = self._build_chat_inputs(messages)
         generation_kwargs: Dict[str, Any] = {
             "do_sample": False,
             "temperature": temperature,
@@ -471,6 +539,7 @@ class LLMChat(LLM):
         kvcomm_state_key = self._build_kvcomm_state_key()
         if kvcomm_state_key is not None:
             generation_kwargs["kvcomm_state_key"] = kvcomm_state_key
+        self._register_flowkv_plan(kvcomm_state_key, flowkv_plan)
         outputs = None
         try:
             outputs = self.model.generate(**inputs, **generation_kwargs)
@@ -512,7 +581,7 @@ class LLMChat(LLM):
                 temperature = self.DEFAULT_TEMPERATURE
             normalised_messages = self._normalise_messages(messages)
             input_char_len = _total_message_chars(normalised_messages)
-            inputs, prompt_text, prompt_length = self._build_chat_inputs(normalised_messages)
+            inputs, prompt_text, prompt_length, flowkv_plan = self._build_chat_inputs(messages)
             logger.opt(colors=True).debug(
                 "<blue>[PROMPT]</blue> Agent {} Role {} Prompt:\n{}",
                 getattr(self, "node_id", "unknown"),
@@ -532,6 +601,7 @@ class LLMChat(LLM):
             )
             if kvcomm_state_key is not None:
                 generation_kwargs["kvcomm_state_key"] = kvcomm_state_key
+            self._register_flowkv_plan(kvcomm_state_key, flowkv_plan)
             ttft_tracer = _TTFTTracer(prompt_length)
             generation_kwargs["stopping_criteria"] = StoppingCriteriaList([ttft_tracer])
             ttft_tracer.reset(prompt_length)
@@ -620,6 +690,11 @@ class LLMChat(LLM):
             "compression_content": "all",
             "divide_method": "step_length",
             "divide_length": self.compress_divide_length,
+            "flowkv_mode": self.flowkv_mode,
+            "flowkv_segment_granularity": self.flowkv_segment_granularity,
+            "flowkv_budget_bias": self.flowkv_budget_bias,
+            "flowkv_core_reserve": self.flowkv_core_reserve,
+            "flowkv_min_agent_budget": self.flowkv_min_agent_budget,
             "attn_heatmap_mode": self.attn_heatmap_mode,
             "attn_heatmap_layer": self.attn_heatmap_layer,
         }
@@ -694,6 +769,11 @@ class LLMChat(LLM):
                 LLMChat._shared_compress_method = self.compress_method
                 LLMChat._shared_compress_budget = self.compress_budget
                 LLMChat._shared_compress_divide_length = self.compress_divide_length
+                LLMChat._shared_flowkv_mode = self.flowkv_mode
+                LLMChat._shared_flowkv_segment_granularity = self.flowkv_segment_granularity
+                LLMChat._shared_flowkv_budget_bias = self.flowkv_budget_bias
+                LLMChat._shared_flowkv_core_reserve = self.flowkv_core_reserve
+                LLMChat._shared_flowkv_min_agent_budget = self.flowkv_min_agent_budget
                 LLMChat._shared_attn_heatmap_mode = self.attn_heatmap_mode
                 LLMChat._shared_attn_heatmap_layer = self.attn_heatmap_layer
                 LLMChat._shared_kvcomm_patched = kvcomm_patched
@@ -712,6 +792,21 @@ class LLMChat(LLM):
             elif self.attn_heatmap_mode != bool(LLMChat._shared_attn_heatmap_mode):
                 raise ValueError(
                     "Model already loaded with a different attention heatmap mode setting. "
+                    "Restart the process to change this option."
+                )
+            elif self.flowkv_mode != bool(LLMChat._shared_flowkv_mode):
+                raise ValueError(
+                    "Model already loaded with a different FlowKV mode setting. "
+                    "Restart the process to change this option."
+                )
+            elif self.flowkv_mode and self.flowkv_segment_granularity != LLMChat._shared_flowkv_segment_granularity:
+                raise ValueError(
+                    "Model already loaded with a different FlowKV segment granularity. "
+                    "Restart the process to change this option."
+                )
+            elif self.flowkv_mode and self.flowkv_budget_bias != LLMChat._shared_flowkv_budget_bias:
+                raise ValueError(
+                    "Model already loaded with a different FlowKV budget bias. "
                     "Restart the process to change this option."
                 )
             elif self.attn_heatmap_mode and self.attn_heatmap_layer != LLMChat._shared_attn_heatmap_layer:

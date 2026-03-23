@@ -26,6 +26,7 @@ from .compression import (
     StreamingLLM,
     H2O,
 )
+from .compression.flowkv import FlowKVSegmentCompressor
 
 import math
 import torch.nn.functional as F
@@ -125,12 +126,41 @@ def LlamaAttention_init(
     self.config.update(patch_config)
     self.kv_cluster = None
     if getattr(self.config, "kvcomm_compress_mode", False):
-        self.kv_cluster = KV_COMPRESSION_MAP[patch_config["method"]](
-            layer_idx=self.layer_idx,
-            model_config=self.config,
-            model_type="llama3",
+        base_cls = KV_COMPRESSION_MAP[patch_config["method"]]
+        base_kwargs = {
+            "layer_idx": self.layer_idx,
+            "model_config": self.config,
+            "model_type": "llama3",
             **patch_config["method_config"],
-        )
+        }
+        if getattr(self.config, "flowkv_mode", False):
+            self.kv_cluster = FlowKVSegmentCompressor(
+                base_cls=base_cls,
+                base_kwargs=base_kwargs,
+                model_config=self.config,
+                flowkv_segment_granularity=getattr(
+                    self.config,
+                    "flowkv_segment_granularity",
+                    "per_agent",
+                ),
+                flowkv_budget_bias=getattr(
+                    self.config,
+                    "flowkv_budget_bias",
+                    "history_first",
+                ),
+                flowkv_core_reserve=getattr(
+                    self.config,
+                    "flowkv_core_reserve",
+                    patch_config["method_config"]["budget"] // 4,
+                ),
+                flowkv_min_agent_budget=getattr(
+                    self.config,
+                    "flowkv_min_agent_budget",
+                    patch_config["method_config"]["window_size"],
+                ),
+            )
+        else:
+            self.kv_cluster = base_cls(**base_kwargs)
     # =============== New logic end =================
 
 def LlamaAttention_forward(
@@ -315,12 +345,41 @@ def Qwen2Attention_init(
     self.config.update(patch_config)
     self.kv_cluster = None
     if getattr(self.config, "kvcomm_compress_mode", False):
-        self.kv_cluster = KV_COMPRESSION_MAP[patch_config["method"]](
-            layer_idx=self.layer_idx,
-            model_config=self.config,
-            model_type="qwen2",
+        base_cls = KV_COMPRESSION_MAP[patch_config["method"]]
+        base_kwargs = {
+            "layer_idx": self.layer_idx,
+            "model_config": self.config,
+            "model_type": "qwen2",
             **patch_config["method_config"],
-        )
+        }
+        if getattr(self.config, "flowkv_mode", False):
+            self.kv_cluster = FlowKVSegmentCompressor(
+                base_cls=base_cls,
+                base_kwargs=base_kwargs,
+                model_config=self.config,
+                flowkv_segment_granularity=getattr(
+                    self.config,
+                    "flowkv_segment_granularity",
+                    "per_agent",
+                ),
+                flowkv_budget_bias=getattr(
+                    self.config,
+                    "flowkv_budget_bias",
+                    "history_first",
+                ),
+                flowkv_core_reserve=getattr(
+                    self.config,
+                    "flowkv_core_reserve",
+                    patch_config["method_config"]["budget"] // 4,
+                ),
+                flowkv_min_agent_budget=getattr(
+                    self.config,
+                    "flowkv_min_agent_budget",
+                    patch_config["method_config"]["window_size"],
+                ),
+            )
+        else:
+            self.kv_cluster = base_cls(**base_kwargs)
     # =============== New logic end =================
 
 

@@ -29,6 +29,11 @@ class AnalyzeAgent(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        flowkv_mode: bool = False,
+        flowkv_segment_granularity: str = "per_agent",
+        flowkv_budget_bias: str = "history_first",
+        flowkv_core_reserve: int = 128,
+        flowkv_min_agent_budget: int = 32,
         attn_heatmap_mode: bool = False,
         attn_heatmap_layer: int | None = None,
         attn_heatmap_output_dir: str | None = None,
@@ -46,6 +51,11 @@ class AnalyzeAgent(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            flowkv_mode=flowkv_mode,
+            flowkv_segment_granularity=flowkv_segment_granularity,
+            flowkv_budget_bias=flowkv_budget_bias,
+            flowkv_core_reserve=flowkv_core_reserve,
+            flowkv_min_agent_budget=flowkv_min_agent_budget,
             attn_heatmap_mode=attn_heatmap_mode,
             attn_heatmap_layer=attn_heatmap_layer,
             attn_heatmap_output_dir=attn_heatmap_output_dir,
@@ -67,9 +77,14 @@ class AnalyzeAgent(Node):
     ) -> Dict[str, Any]:
         """Prepare prompts with default execution mode."""
         system_prompt = f"{self.constraint}"
-        user_prompt = f"The task is: {raw_inputs['task']}\n"
-        spatial_str = ""
-        temporal_str = ""
+        core_segments = [
+            self.make_prompt_segment(
+                kind="core",
+                text=f"The task is: {raw_inputs['task']}\n",
+            )
+        ]
+        current_segments = []
+        past_segments = []
         for id, info in spatial_info.items():
             if self.role == 'Wiki Searcher' and info['role']=='Knowledgeable Expert':
                 queries = find_strings_between_pluses(info['output'])
@@ -88,14 +103,53 @@ class AnalyzeAgent(Node):
                             "source_role": info.get("role"),
                         },
                     )
-                    user_prompt += f"The key entities of the problem are explained in Wikipedia as follows:{self.wiki_summary}"
-            spatial_str += f"Agent {id}, role is {info['role']}, output is:\n\n {info['output']}\n\n"
+                    core_segments.append(
+                        self.make_prompt_segment(
+                            kind="core",
+                            text=f"The key entities of the problem are explained in Wikipedia as follows:{self.wiki_summary}",
+                        )
+                    )
+            current_segments.append(
+                self.make_prompt_segment(
+                    kind="current",
+                    agent_id=id,
+                    role=info.get("role"),
+                    text=f"Agent {id}, role is {info['role']}, output is:\n\n {info['output']}\n\n",
+                )
+            )
         for id, info in temporal_info.items():
-            temporal_str += f"Agent {id}, role is {info['role']}, output is:\n\n {info['output']}\n\n"
+            past_segments.append(
+                self.make_prompt_segment(
+                    kind="past",
+                    agent_id=id,
+                    role=info.get("role"),
+                    text=f"Agent {id}, role is {info['role']}, output is:\n\n {info['output']}\n\n",
+                )
+            )
 
-        user_prompt += f"At the same time, the outputs of other agents are as follows:\n\n{spatial_str} \n\n" if len(spatial_str) else ""
-        user_prompt += f"In the last round of dialogue, the outputs of other agents were: \n\n{temporal_str}" if len(temporal_str) else ""
-        return {"system_prompt": system_prompt, "user_prompt": user_prompt}
+        if current_segments:
+            current_segments = [
+                self.make_prompt_segment(
+                    kind="core",
+                    text="At the same time, the outputs of other agents are as follows:\n\n",
+                ),
+                *current_segments,
+                self.make_prompt_segment(kind="core", text=" \n\n"),
+            ]
+        if past_segments:
+            past_segments = [
+                self.make_prompt_segment(
+                    kind="core",
+                    text="In the last round of dialogue, the outputs of other agents were: \n\n",
+                ),
+                *past_segments,
+            ]
+        return self.build_prompt_payload(
+            system_prompt=system_prompt,
+            core_segments=core_segments,
+            past_segments=past_segments,
+            current_segments=current_segments,
+        )
 
     def _execute(self, input:Dict[str,str],  spatial_info:Dict[str,Dict], temporal_info:Dict[str,Dict],**kwargs):
         """ To be overriden by the descendant class """
@@ -109,9 +163,7 @@ class AnalyzeAgent(Node):
                 **kwargs,
             )
         )
-        system_prompt = inputs["system_prompt"]
-        user_prompt = inputs["user_prompt"]
-        message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
+        message = self.build_llm_messages(inputs)
         response = self.llm.gen(message)
         return response
 
@@ -124,9 +176,7 @@ class AnalyzeAgent(Node):
             temporal_info,
             **kwargs,
         )
-        system_prompt = inputs["system_prompt"]
-        user_prompt = inputs["user_prompt"]
-        message = [{'role':'system','content':system_prompt},{'role':'user','content':user_prompt}]
+        message = self.build_llm_messages(inputs)
         result = await self.llm.agen(
             message,
             max_tokens=self.llm.DEFAULT_MAX_TOKENS,

@@ -21,6 +21,11 @@ class FinalWriteCode(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        flowkv_mode: bool = False,
+        flowkv_segment_granularity: str = "per_agent",
+        flowkv_budget_bias: str = "history_first",
+        flowkv_core_reserve: int = 128,
+        flowkv_min_agent_budget: int = 32,
         attn_heatmap_mode: bool = False,
         attn_heatmap_layer: int | None = None,
         attn_heatmap_output_dir: str | None = None,
@@ -37,6 +42,11 @@ class FinalWriteCode(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            flowkv_mode=flowkv_mode,
+            flowkv_segment_granularity=flowkv_segment_granularity,
+            flowkv_budget_bias=flowkv_budget_bias,
+            flowkv_core_reserve=flowkv_core_reserve,
+            flowkv_min_agent_budget=flowkv_min_agent_budget,
             attn_heatmap_mode=attn_heatmap_mode,
             attn_heatmap_layer=attn_heatmap_layer,
             attn_heatmap_output_dir=attn_heatmap_output_dir,
@@ -125,7 +135,18 @@ class FinalWriteCode(Node):
         self.constraint = self.prompt_set.get_decision_constraint()
         system_prompt = f"{system_prompt}.\n {self.constraint}"
         prefix_text = kwargs.get("prefix", "")
-        spatial_str = ""
+        decision_few_shot = self.prompt_set.get_decision_few_shot()
+        core_segments = [
+            self.make_prompt_segment(
+                kind="core",
+                text=f"{decision_few_shot} {prefix_text} {raw_inputs['task']}\n",
+            ),
+            self.make_prompt_segment(
+                kind="core",
+                text=" At the same time, the output of other agents is as follows:\n\n",
+            ),
+        ]
+        current_segments = []
         if self.domain in {"gsm8k", "mmlu"}:
             for agent_id, info in spatial_info.items():
                 agent_output = info["output"]
@@ -144,8 +165,13 @@ class FinalWriteCode(Node):
                         },
                     )
                     agent_output += f"\n the result is {answer}"
-                spatial_str += (
-                    f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"
+                current_segments.append(
+                    self.make_prompt_segment(
+                        kind="current",
+                        agent_id=agent_id,
+                        role=info.get("role"),
+                        text=f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n",
+                    )
                 )
         elif self.domain == "humaneval":
             for agent_id, info in spatial_info.items():
@@ -169,24 +195,32 @@ class FinalWriteCode(Node):
                             "peer_agent_role": info.get("role"),
                         },
                     )
-                    spatial_str += (
-                        f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"
-                        f"{agent_output}\n\n Whether it passes internal testing?\n{is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                    current_segments.append(
+                        self.make_prompt_segment(
+                            kind="current",
+                            agent_id=agent_id,
+                            role=info.get("role"),
+                            text=(
+                                f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"
+                                f"{agent_output}\n\n Whether it passes internal testing?\n{is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                            ),
+                        )
                     )
                 else:
-                    spatial_str += (
-                        f"Agent {agent_id} as a {info['role']} provides the following info: {agent_output}\n\n"
+                    current_segments.append(
+                        self.make_prompt_segment(
+                            kind="current",
+                            agent_id=agent_id,
+                            role=info.get("role"),
+                            text=f"Agent {agent_id} as a {info['role']} provides the following info: {agent_output}\n\n",
+                        )
                     )
-
-        decision_few_shot = self.prompt_set.get_decision_few_shot()
-        user_prompt = (
-            f"{decision_few_shot} {prefix_text} {raw_inputs['task']}\n At the same time, the output of other agents is as follows:\n\n"
-            f"{spatial_str}\n\n"
+        current_segments.append(self.make_prompt_segment(kind="core", text="\n\n"))
+        return self.build_prompt_payload(
+            system_prompt=system_prompt,
+            core_segments=core_segments,
+            current_segments=current_segments,
         )
-        return {
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-        }
 
     def _execute(self, input:Dict[str,str],  spatial_info:Dict[str,Any], temporal_info:Dict[str,Any],**kwargs):
         """ To be overriden by the descendant class """
@@ -199,10 +233,7 @@ class FinalWriteCode(Node):
                 **kwargs,
             )
         )
-        message = [
-            {"role": "system", "content": inputs["system_prompt"]},
-            {"role": "user", "content": inputs["user_prompt"]},
-        ]
+        message = self.build_llm_messages(inputs)
         response = self.llm.gen(message)
         return response
 
@@ -216,10 +247,7 @@ class FinalWriteCode(Node):
             temporal_info,
             **kwargs,
         )
-        message = [
-            {"role": "system", "content": inputs["system_prompt"]},
-            {"role": "user", "content": inputs["user_prompt"]},
-        ]
+        message = self.build_llm_messages(inputs)
         result = await self.llm.agen(
             message,
             request_uid=request_uid,
@@ -244,6 +272,11 @@ class FinalRefer(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        flowkv_mode: bool = False,
+        flowkv_segment_granularity: str = "per_agent",
+        flowkv_budget_bias: str = "history_first",
+        flowkv_core_reserve: int = 128,
+        flowkv_min_agent_budget: int = 32,
         attn_heatmap_mode: bool = False,
         attn_heatmap_layer: int | None = None,
         attn_heatmap_output_dir: str | None = None,
@@ -260,6 +293,11 @@ class FinalRefer(Node):
             compress_method=compress_method,
             compress_budget=compress_budget,
             compress_divide_length=compress_divide_length,
+            flowkv_mode=flowkv_mode,
+            flowkv_segment_granularity=flowkv_segment_granularity,
+            flowkv_budget_bias=flowkv_budget_bias,
+            flowkv_core_reserve=flowkv_core_reserve,
+            flowkv_min_agent_budget=flowkv_min_agent_budget,
             attn_heatmap_mode=attn_heatmap_mode,
             attn_heatmap_layer=attn_heatmap_layer,
             attn_heatmap_output_dir=attn_heatmap_output_dir,
@@ -283,7 +321,18 @@ class FinalRefer(Node):
         self.constraint = self.prompt_set.get_decision_constraint()
         system_prompt = f"{system_prompt}.\n {self.constraint}"
         prefix_text = kwargs.get("prefix", "")
-        spatial_str = ""
+        decision_few_shot = self.prompt_set.get_decision_few_shot()
+        core_segments = [
+            self.make_prompt_segment(
+                kind="core",
+                text=f"{decision_few_shot} {prefix_text} {raw_inputs['task']}\n",
+            ),
+            self.make_prompt_segment(
+                kind="core",
+                text=" At the same time, the output of other agents is as follows:\n\n",
+            ),
+        ]
+        current_segments = []
         if self.domain in {"gsm8k", "mmlu"}:
             for agent_id, info in spatial_info.items():
                 agent_output = info["output"]
@@ -302,8 +351,13 @@ class FinalRefer(Node):
                         },
                     )
                     agent_output += f"\n the result is {answer}"
-                spatial_str += (
-                    f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n"
+                current_segments.append(
+                    self.make_prompt_segment(
+                        kind="current",
+                        agent_id=agent_id,
+                        role=info.get("role"),
+                        text=f"Agent {agent_id}, role is {info['role']}, output is:\n\n {agent_output}\n\n",
+                    )
                 )
         elif self.domain == "humaneval":
             for agent_id, info in spatial_info.items():
@@ -327,24 +381,32 @@ class FinalRefer(Node):
                             "peer_agent_role": info.get("role"),
                         },
                     )
-                    spatial_str += (
-                        f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"
-                        f"{agent_output}\n\n Whether it passes internal testing?\n{is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                    current_segments.append(
+                        self.make_prompt_segment(
+                            kind="current",
+                            agent_id=agent_id,
+                            role=info.get("role"),
+                            text=(
+                                f"Agent {agent_id} as a {info['role']}:\n\nThe code written by the agent is:\n\n"
+                                f"{agent_output}\n\n Whether it passes internal testing?\n{is_solved}.\n\nThe feedback is:\n\n {feedback}.\n\n"
+                            ),
+                        )
                     )
                 else:
-                    spatial_str += (
-                        f"Agent {agent_id} as a {info['role']} provides the following info: {agent_output}\n\n"
+                    current_segments.append(
+                        self.make_prompt_segment(
+                            kind="current",
+                            agent_id=agent_id,
+                            role=info.get("role"),
+                            text=f"Agent {agent_id} as a {info['role']} provides the following info: {agent_output}\n\n",
+                        )
                     )
-
-        decision_few_shot = self.prompt_set.get_decision_few_shot()
-        user_prompt = (
-            f"{decision_few_shot} {prefix_text} {raw_inputs['task']}\n At the same time, the output of other agents is as follows:\n\n"
-            f"{spatial_str}\n\n"
+        current_segments.append(self.make_prompt_segment(kind="core", text="\n\n"))
+        return self.build_prompt_payload(
+            system_prompt=system_prompt,
+            core_segments=core_segments,
+            current_segments=current_segments,
         )
-        return {
-            "system_prompt": system_prompt,
-            "user_prompt": user_prompt,
-        }
 
     def extract_example(self, prompt: str) -> list:
         prompt = prompt['task']
@@ -373,7 +435,7 @@ class FinalRefer(Node):
                 **kwargs,
             )
         )
-        message = [{'role':'system','content':inputs["system_prompt"]},{'role':'user','content':inputs["user_prompt"]}]
+        message = self.build_llm_messages(inputs)
         response = self.llm.gen(message)
         return response
 
@@ -388,7 +450,7 @@ class FinalRefer(Node):
             temporal_info,
             **kwargs,
         )
-        message = [{'role':'system','content':inputs["system_prompt"]},{'role':'user','content':inputs["user_prompt"]}]
+        message = self.build_llm_messages(inputs)
         result = await self.llm.agen(
             message,
             request_uid=request_uid,
@@ -411,6 +473,11 @@ class FinalDirect(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        flowkv_mode: bool = False,
+        flowkv_segment_granularity: str = "per_agent",
+        flowkv_budget_bias: str = "history_first",
+        flowkv_core_reserve: int = 128,
+        flowkv_min_agent_budget: int = 32,
         attn_heatmap_mode: bool = False,
         attn_heatmap_layer: int | None = None,
         attn_heatmap_output_dir: str | None = None,
@@ -461,6 +528,11 @@ class FinalMajorVote(Node):
         compress_method: str = "rkv",
         compress_budget: int = 1024,
         compress_divide_length: int = 128,
+        flowkv_mode: bool = False,
+        flowkv_segment_granularity: str = "per_agent",
+        flowkv_budget_bias: str = "history_first",
+        flowkv_core_reserve: int = 128,
+        flowkv_min_agent_budget: int = 32,
         attn_heatmap_mode: bool = False,
         attn_heatmap_layer: int | None = None,
         attn_heatmap_output_dir: str | None = None,
