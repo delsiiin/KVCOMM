@@ -41,16 +41,22 @@ def build_compression_tag(compress_mode: bool, compress_method: str, compress_bu
     return f"compress-{safe_method}-b{int(compress_budget)}"
 
 
+def build_flowkv_tag(flowkv_mode: bool) -> str:
+    return "flowkv-on" if flowkv_mode else "flowkv-off"
+
+
 def build_runtime_tag(
     compress_mode: bool,
     compress_method: str,
     compress_budget: int,
+    flowkv_mode: bool,
     attn_heatmap_mode: bool,
     attn_heatmap_layer: int | None,
 ) -> str:
     compression_tag = build_compression_tag(compress_mode, compress_method, compress_budget)
+    flowkv_tag = build_flowkv_tag(flowkv_mode)
     heatmap_tag = build_heatmap_tag(attn_heatmap_mode, attn_heatmap_layer)
-    return f"{compression_tag}_{heatmap_tag}"
+    return f"{compression_tag}_{flowkv_tag}_{heatmap_tag}"
 
 
 def load_result(result_file: Path) -> list:
@@ -133,6 +139,7 @@ async def main():
         args.compress_mode,
         args.compress_method,
         args.compress_budget,
+        args.flowkv_mode,
         args.attn_heatmap_mode,
         args.attn_heatmap_layer,
     )

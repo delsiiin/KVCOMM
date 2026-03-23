@@ -35,6 +35,21 @@ def build_compression_tag(compress_mode: bool, compress_method: str, compress_bu
     return f"compress-{safe_method}-b{int(compress_budget)}"
 
 
+def build_flowkv_tag(flowkv_mode: bool) -> str:
+    return "flowkv-on" if flowkv_mode else "flowkv-off"
+
+
+def build_runtime_tag(
+    compress_mode: bool,
+    compress_method: str,
+    compress_budget: int,
+    flowkv_mode: bool,
+) -> str:
+    compression_tag = build_compression_tag(compress_mode, compress_method, compress_budget)
+    flowkv_tag = build_flowkv_tag(flowkv_mode)
+    return f"{compression_tag}_{flowkv_tag}"
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="KVCOMM Experiments on TTFT Benchmark")
     parser.add_argument(
@@ -163,7 +178,12 @@ async def main():
     args = parse_args()
     output_dir = Path(args.output_dir).expanduser()
     output_dir.mkdir(parents=True, exist_ok=True)
-    compression_tag = build_compression_tag(args.compress_mode, args.compress_method, args.compress_budget)
+    runtime_tag = build_runtime_tag(
+        args.compress_mode,
+        args.compress_method,
+        args.compress_budget,
+        args.flowkv_mode,
+    )
     agent_names = [name for name, num in zip(args.agent_names, args.agent_nums) for _ in range(num)]
     kwargs = get_kwargs(args.mode, len(agent_names))
     kv_config = KVCommConfig.from_env().apply_overrides(
@@ -192,12 +212,12 @@ async def main():
         **kwargs,
     )
 
-    configure_logging(log_path=output_dir / "logs" / f"log_{compression_tag}.txt")
+    configure_logging(log_path=output_dir / "logs" / f"log_{runtime_tag}.txt")
     _ = await evaluate(
         graph=graph,
         samples=args.samples,
         output_dir=str(output_dir),
-        compression_tag=compression_tag,
+        compression_tag=runtime_tag,
         num_rounds=args.num_rounds,
     )
 
