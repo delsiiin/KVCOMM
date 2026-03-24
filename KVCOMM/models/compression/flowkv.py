@@ -29,7 +29,6 @@ class FlowKVSegmentCompressor:
         model_config: Any,
         flowkv_segment_granularity: str = "per_agent",
         flowkv_budget_bias: str = "history_first",
-        flowkv_core_reserve: int = 128,
         flowkv_min_agent_budget: int = 32,
     ):
         self.base_cls = base_cls
@@ -40,7 +39,6 @@ class FlowKVSegmentCompressor:
         self.first_tokens = max(1, int(base_kwargs.get("first_tokens", 1)))
         self.segment_granularity = (flowkv_segment_granularity or "per_agent").lower().strip()
         self.budget_bias = (flowkv_budget_bias or "history_first").lower().strip()
-        self.core_reserve = max(0, int(flowkv_core_reserve))
         self.min_agent_budget = max(0, int(flowkv_min_agent_budget))
         self._fallback = self.base_cls(**self.base_kwargs)
 
@@ -61,16 +59,27 @@ class FlowKVSegmentCompressor:
             )
 
         seq_len = int(key_states.shape[-2])
-        if seq_len <= self.budget or not plan.segments:
+        if not plan.segments:
             return key_states, value_states
 
         prompt_segments = [segment for segment in plan.segments if segment.current_token_length > 0]
         prompt_len = sum(int(segment.current_token_length) for segment in prompt_segments)
         prompt_len = min(prompt_len, seq_len)
         generated_len = max(0, seq_len - prompt_len)
+        preserved_core_len = sum(
+            int(segment.current_token_length)
+            for segment in prompt_segments
+            if segment.kind == "core"
+        )
+        compressible_len = max(0, seq_len - preserved_core_len)
+        if compressible_len <= self.budget:
+            return key_states, value_states
 
         descriptors = self._build_budget_descriptors(prompt_segments, generated_len)
-        budgets = self._allocate_budgets(descriptors, self.budget)
+        budgets = self._allocate_budgets(
+            descriptors,
+            self.budget,
+        )
         if sum(budgets) <= 0:
             return self._fallback.update_kv(
                 key_states,
@@ -119,20 +128,11 @@ class FlowKVSegmentCompressor:
 
     def _build_budget_descriptors(self, prompt_segments, generated_len: int) -> List[_SegmentBudget]:
         descriptors: List[_SegmentBudget] = []
-        core_lengths = [
-            int(segment.current_token_length)
-            for segment in prompt_segments
-            if segment.kind == "core"
-        ]
-        total_core_len = sum(core_lengths)
-        remaining_core_reserve = min(self.core_reserve, total_core_len)
-
         for index, segment in enumerate(prompt_segments):
             length = int(segment.current_token_length)
             minimum = 0
-            if segment.kind == "core" and remaining_core_reserve > 0 and total_core_len > 0:
-                exact = self.core_reserve * (length / total_core_len)
-                minimum = min(length, max(0, math.floor(exact)))
+            if segment.kind == "core":
+                minimum = length
             elif segment.kind == "past":
                 minimum = min(length, self.min_agent_budget)
             descriptors.append(
@@ -146,25 +146,13 @@ class FlowKVSegmentCompressor:
                 )
             )
 
-        assigned_core = sum(item.minimum for item in descriptors if item.kind == "core")
-        core_gap = max(0, remaining_core_reserve - assigned_core)
-        if core_gap:
-            for item in descriptors:
-                if core_gap <= 0:
-                    break
-                if item.kind != "core":
-                    continue
-                extra = min(item.length - item.minimum, core_gap)
-                item.minimum += extra
-                core_gap -= extra
-
         if generated_len > 0:
             descriptors.append(
                 _SegmentBudget(
                     index=-1,
                     kind="generated",
                     length=generated_len,
-                    minimum=min(generated_len, self.window_size),
+                    minimum=0,
                     weight=self._weight_for_kind("generated"),
                     is_plan_segment=False,
                 )
@@ -173,19 +161,22 @@ class FlowKVSegmentCompressor:
 
     def _weight_for_kind(self, kind: str) -> float:
         if self.budget_bias == "current_first":
-            weights = {"core": 2.0, "past": 1.0, "current": 2.0, "generated": 2.0}
+            weights = {"core": 0.0, "past": 1.0, "current": 2.0, "generated": 2.0}
         elif self.budget_bias == "length_ratio":
-            weights = {"core": 1.5, "past": 1.0, "current": 1.0, "generated": 1.0}
+            weights = {"core": 0.0, "past": 1.5, "current": 1.0, "generated": 0.5}
         else:
-            weights = {"core": 2.5, "past": 2.0, "current": 1.0, "generated": 1.5}
+            weights = {"core": 0.0, "past": 3.0, "current": 2.0, "generated": 1.0}
         return float(weights.get(kind, 1.0))
 
     def _allocate_budgets(self, descriptors: Sequence[_SegmentBudget], total_budget: int) -> List[int]:
-        budgets = [0 for _ in descriptors]
+        budgets = [
+            descriptor.length if descriptor.kind == "core" else 0
+            for descriptor in descriptors
+        ]
         remaining = max(0, int(total_budget))
 
-        # Allocate minimum budgets in priority order: core -> generated -> past -> current.
-        priorities = {"core": 0, "generated": 1, "past": 2, "current": 3}
+        # Core is preserved in full. The remaining budget is allocated past -> current -> generated.
+        priorities = {"past": 0, "current": 1, "generated": 2}
         for idx in sorted(range(len(descriptors)), key=lambda item: priorities.get(descriptors[item].kind, 4)):
             if remaining <= 0:
                 break

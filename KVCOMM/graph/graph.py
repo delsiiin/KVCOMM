@@ -57,7 +57,6 @@ class Graph(ABC):
                 flowkv_mode: bool = False,
                 flowkv_segment_granularity: str = "per_agent",
                 flowkv_budget_bias: str = "history_first",
-                flowkv_core_reserve: int = 128,
                 flowkv_min_agent_budget: int = 32,
                 attn_heatmap_mode: bool = False,
                 attn_heatmap_layer: Optional[int] = None,
@@ -89,7 +88,6 @@ class Graph(ABC):
             flowkv_segment_granularity or "per_agent"
         ).lower().strip()
         self.flowkv_budget_bias = (flowkv_budget_bias or "history_first").lower().strip()
-        self.flowkv_core_reserve = int(flowkv_core_reserve)
         self.flowkv_min_agent_budget = int(flowkv_min_agent_budget)
         self.attn_heatmap_mode = bool(attn_heatmap_mode)
         self.attn_heatmap_layer = (
@@ -111,7 +109,6 @@ class Graph(ABC):
                 "flowkv_mode": self.flowkv_mode,
                 "flowkv_segment_granularity": self.flowkv_segment_granularity,
                 "flowkv_budget_bias": self.flowkv_budget_bias,
-                "flowkv_core_reserve": self.flowkv_core_reserve,
                 "flowkv_min_agent_budget": self.flowkv_min_agent_budget,
                 "attn_heatmap_mode": self.attn_heatmap_mode,
                 "attn_heatmap_layer": self.attn_heatmap_layer,
@@ -133,7 +130,6 @@ class Graph(ABC):
             kwargs.setdefault("flowkv_mode", self.flowkv_mode)
             kwargs.setdefault("flowkv_segment_granularity", self.flowkv_segment_granularity)
             kwargs.setdefault("flowkv_budget_bias", self.flowkv_budget_bias)
-            kwargs.setdefault("flowkv_core_reserve", self.flowkv_core_reserve)
             kwargs.setdefault("flowkv_min_agent_budget", self.flowkv_min_agent_budget)
             kwargs.setdefault("attn_heatmap_mode", self.attn_heatmap_mode)
             kwargs.setdefault("attn_heatmap_layer", self.attn_heatmap_layer)

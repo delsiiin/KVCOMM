@@ -148,11 +148,6 @@ def LlamaAttention_init(
                     "flowkv_budget_bias",
                     "history_first",
                 ),
-                flowkv_core_reserve=getattr(
-                    self.config,
-                    "flowkv_core_reserve",
-                    patch_config["method_config"]["budget"] // 4,
-                ),
                 flowkv_min_agent_budget=getattr(
                     self.config,
                     "flowkv_min_agent_budget",
@@ -366,11 +361,6 @@ def Qwen2Attention_init(
                     self.config,
                     "flowkv_budget_bias",
                     "history_first",
-                ),
-                flowkv_core_reserve=getattr(
-                    self.config,
-                    "flowkv_core_reserve",
-                    patch_config["method_config"]["budget"] // 4,
                 ),
                 flowkv_min_agent_budget=getattr(
                     self.config,
