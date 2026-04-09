@@ -982,6 +982,10 @@ def _viewer_html() -> str:
       if (!state.selectedRun || !state.selectedRequest || state.selectedRound == null || !state.selectedAgent) {
         return;
       }
+      const previousLayerValue =
+        state.layerData?.layer_idx ??
+        state.agentDetail?.available_layers?.[state.selectedLayerIndex] ??
+        null;
       const runTag = encodeURIComponent(state.selectedRun);
       const requestUid = encodeURIComponent(state.selectedRequest);
       const agentId = encodeURIComponent(state.selectedAgent);
@@ -989,7 +993,19 @@ def _viewer_html() -> str:
       const url = "/api/runs/" + runTag + "/requests/" + requestUid + "/agents/" + agentId + "?round_index=" + encodeURIComponent(state.selectedRound);
       state.agentDetail = await fetchJson(url);
       state.promptSegments = buildPromptSegments(state.agentDetail?.tokens || []);
-      state.selectedLayerIndex = 0;
+      const layers = state.agentDetail?.available_layers || [];
+      if (!layers.length) {
+        state.selectedLayerIndex = 0;
+      } else if (previousLayerValue != null) {
+        const matchedIndex = layers.findIndex((layer) => Number(layer) === Number(previousLayerValue));
+        if (matchedIndex >= 0) {
+          state.selectedLayerIndex = matchedIndex;
+        } else {
+          state.selectedLayerIndex = clamp(state.selectedLayerIndex, 0, layers.length - 1);
+        }
+      } else {
+        state.selectedLayerIndex = clamp(state.selectedLayerIndex, 0, layers.length - 1);
+      }
       renderMetadata();
       await loadLayer();
     }
