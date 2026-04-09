@@ -20,7 +20,10 @@ from KVCOMM.llm.format import Message
 from KVCOMM.llm.llm import LLM
 from KVCOMM.llm.llm_registry import LLMRegistry
 from KVCOMM.models.monkeypatch import replace_llama, replace_qwen2
-from KVCOMM.utils.attention_heatmap import export_attention_heatmap
+from KVCOMM.utils.attention_heatmap import (
+    decode_token_texts,
+    export_attention_visualization,
+)
 from KVCOMM.utils.log import logger
 from KVCOMM.utils.metrics import GenerationResult
 
@@ -405,9 +408,21 @@ class LLMChat(LLM):
         capture = captures.pop(state_key, None)
         if not isinstance(capture, dict):
             return None
-        if capture.get("matrix") is None:
+        matrices = capture.get("matrices")
+        if not isinstance(matrices, dict) or not matrices:
             return None
         return capture
+
+    def _extract_prompt_tokens(
+        self,
+        inputs: Dict[str, Any],
+    ) -> tuple[list[int], list[str]]:
+        input_ids_tensor = inputs.get("input_ids")
+        if not isinstance(input_ids_tensor, torch.Tensor) or input_ids_tensor.ndim != 2:
+            return [], []
+        token_ids = [int(token_id) for token_id in input_ids_tensor[0].detach().cpu().tolist()]
+        token_texts = decode_token_texts(self.tokenizer, token_ids)
+        return token_ids, token_texts
 
     def _export_attention_heatmap_if_needed(
         self,
@@ -418,9 +433,13 @@ class LLMChat(LLM):
         agent_id: Optional[str],
         agent_name: Optional[str],
         agent_role: Optional[str],
+        prompt_text: str,
+        response_text: str,
+        input_token_ids: list[int],
+        input_token_texts: list[str],
         input_token_len: Optional[int],
         output_token_len: Optional[int],
-    ) -> Optional[Dict[str, str]]:
+    ) -> Optional[Dict[str, Any]]:
         if not self.attn_heatmap_mode:
             return None
         if not self.attn_heatmap_output_dir or not self.attn_heatmap_run_tag:
@@ -435,8 +454,8 @@ class LLMChat(LLM):
                 self.attn_heatmap_layer,
             )
             return None
-        return export_attention_heatmap(
-            matrix=capture.get("matrix"),
+        return export_attention_visualization(
+            matrices=capture.get("matrices", {}),
             output_dir=self.attn_heatmap_output_dir,
             run_tag=self.attn_heatmap_run_tag,
             request_uid=request_uid,
@@ -444,7 +463,10 @@ class LLMChat(LLM):
             agent_id=agent_id,
             agent_name=agent_name,
             agent_role=agent_role,
-            layer_idx=int(capture.get("layer_idx", self.attn_heatmap_layer or -1)),
+            prompt_text=prompt_text,
+            response_text=response_text,
+            input_token_ids=input_token_ids,
+            input_token_texts=input_token_texts,
             input_token_len=input_token_len,
             output_token_len=output_token_len,
         )
@@ -459,7 +481,8 @@ class LLMChat(LLM):
             max_tokens = self.DEFAULT_MAX_TOKENS
         if temperature is None:
             temperature = self.DEFAULT_TEMPERATURE
-        inputs, _, prompt_length = self._build_chat_inputs(messages)
+        inputs, prompt_text, prompt_length = self._build_chat_inputs(messages)
+        prompt_token_ids, prompt_token_texts = self._extract_prompt_tokens(inputs)
         generation_kwargs: Dict[str, Any] = {
             "do_sample": False,
             "temperature": temperature,
@@ -475,6 +498,9 @@ class LLMChat(LLM):
         try:
             outputs = self.model.generate(**inputs, **generation_kwargs)
             generated_sequence = outputs.sequences[:, prompt_length:]
+            response_message = self.tokenizer.decode(
+                generated_sequence[0], skip_special_tokens=True
+            ).strip()
             self._export_attention_heatmap_if_needed(
                 state_key=kvcomm_state_key,
                 request_uid=None,
@@ -482,6 +508,10 @@ class LLMChat(LLM):
                 agent_id=getattr(self, "node_id", None),
                 agent_name=None,
                 agent_role=getattr(self, "role", None),
+                prompt_text=prompt_text,
+                response_text=response_message,
+                input_token_ids=prompt_token_ids,
+                input_token_texts=prompt_token_texts,
                 input_token_len=int(prompt_length),
                 output_token_len=int(generated_sequence.shape[-1]),
             )
@@ -513,6 +543,7 @@ class LLMChat(LLM):
             normalised_messages = self._normalise_messages(messages)
             input_char_len = _total_message_chars(normalised_messages)
             inputs, prompt_text, prompt_length = self._build_chat_inputs(normalised_messages)
+            prompt_token_ids, prompt_token_texts = self._extract_prompt_tokens(inputs)
             logger.opt(colors=True).debug(
                 "<blue>[PROMPT]</blue> Agent {} Role {} Prompt:\n{}",
                 getattr(self, "node_id", "unknown"),
@@ -539,6 +570,9 @@ class LLMChat(LLM):
             try:
                 outputs = self.model.generate(**inputs, **generation_kwargs)
                 generated_sequence = outputs.sequences[:, prompt_length:]
+                response_message = self.tokenizer.decode(
+                    generated_sequence[0], skip_special_tokens=True
+                ).strip()
                 heatmap_artifacts = self._export_attention_heatmap_if_needed(
                     state_key=kvcomm_state_key,
                     request_uid=request_uid,
@@ -546,6 +580,10 @@ class LLMChat(LLM):
                     agent_id=agent_id,
                     agent_name=agent_name,
                     agent_role=agent_role,
+                    prompt_text=prompt_text,
+                    response_text=response_message,
+                    input_token_ids=prompt_token_ids,
+                    input_token_texts=prompt_token_texts,
                     input_token_len=int(prompt_length),
                     output_token_len=int(generated_sequence.shape[-1]),
                 )
@@ -601,8 +639,6 @@ class LLMChat(LLM):
             raise ValueError(
                 f"compress_divide_length must be > 0, got {self.compress_divide_length}."
             )
-        if self.attn_heatmap_mode and self.attn_heatmap_layer is None:
-            raise ValueError("attn_heatmap_layer must be set when attn_heatmap_mode is enabled.")
         return {
             "method": method,
             "method_config": {
@@ -685,7 +721,11 @@ class LLMChat(LLM):
                 )
                 if self.attn_heatmap_mode:
                     num_layers = getattr(LLMChat._shared_model.config, "num_hidden_layers", None)
-                    if num_layers is not None and not (0 <= int(self.attn_heatmap_layer) < int(num_layers)):
+                    if (
+                        self.attn_heatmap_layer is not None
+                        and num_layers is not None
+                        and not (0 <= int(self.attn_heatmap_layer) < int(num_layers))
+                    ):
                         raise ValueError(
                             f"attn_heatmap_layer must be in [0, {int(num_layers) - 1}], "
                             f"got {self.attn_heatmap_layer}."

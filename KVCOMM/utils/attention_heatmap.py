@@ -1,23 +1,30 @@
 from __future__ import annotations
 
 import json
+import logging
 import re
 from pathlib import Path
-from typing import Any, Dict, Optional
+from threading import Lock
+from typing import Any, Dict, Iterable, Optional
 
 import numpy as np
-from loguru import logger
+try:
+    from loguru import logger
+except ImportError:  # pragma: no cover - fallback for lightweight test environments
+    logger = logging.getLogger(__name__)
+
+_SESSION_INDEX_LOCK = Lock()
 
 
 def build_heatmap_tag(
     attn_heatmap_mode: bool,
     attn_heatmap_layer: Optional[int],
 ) -> str:
-    """Return a stable tag segment for attention heatmap artifacts."""
+    """Return a stable tag segment for attention visualization artifacts."""
     if not attn_heatmap_mode:
         return "no-heatmap"
     if attn_heatmap_layer is None:
-        return "heatmap-layer-unknown"
+        return "heatmap-all-layers"
     return f"heatmap-l{int(attn_heatmap_layer)}"
 
 
@@ -31,9 +38,93 @@ def sanitize_filename_component(value: Any) -> str:
     return text or "unknown"
 
 
-def export_attention_heatmap(
+def _log_artifact(payload: Dict[str, Any]) -> None:
+    if hasattr(logger, "opt"):
+        logger.opt(colors=True).info(
+            "<blue>[ATTN VIS]</blue> {}",
+            json.dumps(payload, ensure_ascii=False),
+        )
+        return
+    logger.info("[ATTN VIS] %s", json.dumps(payload, ensure_ascii=False))
+
+
+def _decode_token(tokenizer: Any, token_id: int) -> str:
+    try:
+        text = tokenizer.decode(
+            [int(token_id)],
+            skip_special_tokens=False,
+            clean_up_tokenization_spaces=False,
+        )
+    except TypeError:
+        text = tokenizer.decode([int(token_id)], skip_special_tokens=False)
+    except Exception:
+        text = ""
+    if text:
+        return text
+    try:
+        return str(tokenizer.convert_ids_to_tokens(int(token_id)))
+    except Exception:
+        return str(token_id)
+
+
+def decode_token_texts(tokenizer: Any, token_ids: Iterable[int]) -> list[str]:
+    return [_decode_token(tokenizer, int(token_id)) for token_id in token_ids]
+
+
+def compute_matrix_stats(matrix: Any) -> Dict[str, float]:
+    matrix_np = np.asarray(matrix, dtype=np.float32)
+    if matrix_np.size == 0:
+        return {
+            "min": 0.0,
+            "max": 0.0,
+            "mean": 0.0,
+            "p1": 0.0,
+            "p95": 0.0,
+            "p99": 0.0,
+        }
+    return {
+        "min": float(np.min(matrix_np)),
+        "max": float(np.max(matrix_np)),
+        "mean": float(np.mean(matrix_np)),
+        "p1": float(np.percentile(matrix_np, 1)),
+        "p95": float(np.percentile(matrix_np, 95)),
+        "p99": float(np.percentile(matrix_np, 99)),
+    }
+
+
+def compute_token_scores(matrix: Any) -> list[float]:
+    matrix_np = np.asarray(matrix, dtype=np.float32)
+    if matrix_np.ndim != 2 or matrix_np.shape[1] == 0:
+        return []
+    return matrix_np.mean(axis=0, dtype=np.float32).astype(np.float32).tolist()
+
+
+def _normalise_relpath(path: Path, base: Path) -> str:
+    try:
+        return str(path.relative_to(base))
+    except ValueError:
+        return str(path)
+
+
+def _load_session_index(index_path: Path, run_tag: str) -> Dict[str, Any]:
+    if not index_path.exists():
+        return {"run_tag": run_tag, "calls": []}
+    try:
+        with index_path.open("r", encoding="utf-8") as handle:
+            payload = json.load(handle)
+    except Exception:
+        logger.warning("Failed to read session index {}, rebuilding.", index_path)
+        return {"run_tag": run_tag, "calls": []}
+    if not isinstance(payload, dict):
+        return {"run_tag": run_tag, "calls": []}
+    payload.setdefault("run_tag", run_tag)
+    payload.setdefault("calls", [])
+    return payload
+
+
+def export_attention_visualization(
     *,
-    matrix: Any,
+    matrices: Dict[int, Any],
     output_dir: str | Path,
     run_tag: str,
     request_uid: Optional[str],
@@ -41,91 +132,126 @@ def export_attention_heatmap(
     agent_id: Optional[str],
     agent_name: Optional[str],
     agent_role: Optional[str],
-    layer_idx: int,
+    prompt_text: str,
+    response_text: str,
+    input_token_ids: list[int],
+    input_token_texts: list[str],
     input_token_len: Optional[int] = None,
     output_token_len: Optional[int] = None,
-) -> Optional[Dict[str, str]]:
-    """Persist one attention heatmap PNG plus JSON metadata sidecar."""
-    try:
-        import matplotlib.pyplot as plt
-    except Exception as exc:
-        logger.warning("Matplotlib unavailable, skip attention heatmap export: {}", exc)
-        return None
-
-    matrix_np = np.asarray(matrix, dtype=np.float32)
-    if matrix_np.ndim != 2:
+) -> Optional[Dict[str, Any]]:
+    """Persist one agent call as structured attention visualization artifacts."""
+    if not matrices:
         logger.warning(
-            "Attention heatmap expects a 2D matrix, got shape {}. Skip export.",
-            tuple(matrix_np.shape),
+            "Attention visualization export skipped because no matrices were captured for request={} agent={}.",
+            request_uid,
+            agent_id,
         )
         return None
 
     output_path = Path(output_dir).expanduser()
-    output_path.mkdir(parents=True, exist_ok=True)
-
+    safe_run_tag = sanitize_filename_component(run_tag)
+    run_dir = output_path / safe_run_tag
     safe_request_uid = sanitize_filename_component(request_uid or "no-request")
-    safe_agent_id = sanitize_filename_component(agent_id or "unknown-agent")
-    safe_agent_role = sanitize_filename_component(agent_role or "unknown-role")
-    safe_agent_name = sanitize_filename_component(agent_name or "unknown-name")
     safe_round = "na" if round_index is None else str(int(round_index))
-    stem = (
-        f"{sanitize_filename_component(run_tag)}"
-        f"_req-{safe_request_uid}"
-        f"_round-{safe_round}"
-        f"_agent-{safe_agent_id}"
-        f"_role-{safe_agent_role}"
-        f"_layer-{int(layer_idx)}"
-    )
+    safe_agent_id = sanitize_filename_component(agent_id or "unknown-agent")
+    request_dir = run_dir / "requests" / f"req-{safe_request_uid}" / f"round-{safe_round}"
+    request_dir.mkdir(parents=True, exist_ok=True)
 
-    png_path = output_path / f"{stem}.png"
-    json_path = output_path / f"{stem}.json"
+    json_path = request_dir / f"agent-{safe_agent_id}.json"
+    npz_path = request_dir / f"agent-{safe_agent_id}.npz"
+    index_path = run_dir / "session_index.json"
 
-    fig_width = max(8.0, min(22.0, matrix_np.shape[1] / 24.0))
-    fig_height = max(6.0, min(18.0, matrix_np.shape[0] / 24.0))
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    image = ax.imshow(matrix_np, aspect="auto", interpolation="nearest", cmap="Blues", vmin=0.0, vmax=0.01)
-    ax.set_xlabel("Key Position")
-    ax.set_ylabel("Query Position")
-    ax.set_title(
-        "\n".join(
-            [
-                run_tag,
-                (
-                    f"request={request_uid or 'n/a'} | round={safe_round} | "
-                    f"agent_id={agent_id or 'n/a'} | role={agent_role or 'n/a'} | "
-                    f"layer={int(layer_idx)}"
-                ),
-            ]
+    serialisable_matrices: Dict[str, np.ndarray] = {}
+    matrix_stats: Dict[str, Dict[str, float]] = {}
+    available_layers: list[int] = sorted(int(layer_idx) for layer_idx in matrices.keys())
+
+    for layer_idx in available_layers:
+        matrix_np = np.asarray(matrices[layer_idx], dtype=np.float32)
+        if matrix_np.ndim != 2:
+            logger.warning(
+                "Skipping invalid attention matrix for request={} agent={} layer={} with shape {}.",
+                request_uid,
+                agent_id,
+                layer_idx,
+                tuple(matrix_np.shape),
+            )
+            continue
+        serialisable_matrices[f"layer_{layer_idx}"] = matrix_np
+        matrix_stats[str(layer_idx)] = compute_matrix_stats(matrix_np)
+
+    if not serialisable_matrices:
+        logger.warning(
+            "Attention visualization export skipped because no 2D matrices were serialisable for request={} agent={}.",
+            request_uid,
+            agent_id,
         )
-    )
-    fig.colorbar(image, ax=ax, fraction=0.046, pad=0.04, label="Attention Weight")
-    fig.tight_layout()
-    fig.savefig(png_path, dpi=220, bbox_inches="tight")
-    plt.close(fig)
+        return None
 
-    metadata = {
+    np.savez_compressed(npz_path, **serialisable_matrices)
+
+    detail_payload = {
         "run_tag": run_tag,
         "request_uid": request_uid,
         "round_index": round_index,
         "agent_id": agent_id,
         "agent_name": agent_name,
         "agent_role": agent_role,
-        "layer_idx": int(layer_idx),
-        "shape": [int(matrix_np.shape[0]), int(matrix_np.shape[1])],
+        "prompt_text": prompt_text,
+        "response_text": response_text,
+        "token_ids": [int(token_id) for token_id in input_token_ids],
+        "tokens": list(input_token_texts),
         "input_token_len": input_token_len,
         "output_token_len": output_token_len,
-        "png_path": str(png_path),
-        "agent_name_sanitized": safe_agent_name,
+        "available_layers": available_layers,
+        "matrix_shape": list(next(iter(serialisable_matrices.values())).shape),
+        "matrix_stats": matrix_stats,
+        "npz_path": _normalise_relpath(npz_path, run_dir),
     }
     with json_path.open("w", encoding="utf-8") as handle:
-        json.dump(metadata, handle, ensure_ascii=False, indent=2)
+        json.dump(detail_payload, handle, ensure_ascii=False, indent=2)
+
+    index_entry = {
+        "request_uid": request_uid,
+        "round_index": round_index,
+        "agent_id": agent_id,
+        "agent_name": agent_name,
+        "agent_role": agent_role,
+        "available_layers": available_layers,
+        "json_path": _normalise_relpath(json_path, run_dir),
+        "npz_path": _normalise_relpath(npz_path, run_dir),
+    }
+
+    with _SESSION_INDEX_LOCK:
+        run_dir.mkdir(parents=True, exist_ok=True)
+        index_payload = _load_session_index(index_path, run_tag)
+        calls = index_payload.setdefault("calls", [])
+        replaced = False
+        for idx, existing in enumerate(calls):
+            if (
+                existing.get("request_uid") == request_uid
+                and existing.get("round_index") == round_index
+                and existing.get("agent_id") == agent_id
+            ):
+                calls[idx] = index_entry
+                replaced = True
+                break
+        if not replaced:
+            calls.append(index_entry)
+        calls.sort(
+            key=lambda item: (
+                str(item.get("request_uid") or ""),
+                int(item.get("round_index") or -1),
+                str(item.get("agent_id") or ""),
+            )
+        )
+        with index_path.open("w", encoding="utf-8") as handle:
+            json.dump(index_payload, handle, ensure_ascii=False, indent=2)
 
     artifacts = {
-        "png_path": str(png_path),
+        "run_dir": str(run_dir),
         "json_path": str(json_path),
+        "npz_path": str(npz_path),
+        "available_layers": available_layers,
     }
-    logger.opt(colors=True).info(
-        "<blue>[ATTN HEATMAP]</blue> {}",
-        json.dumps(artifacts, ensure_ascii=False),
-    )
+    _log_artifact(artifacts)
     return artifacts

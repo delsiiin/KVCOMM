@@ -48,22 +48,21 @@ def _capture_prefill_attention_heatmap(
     heatmap_capture: Optional[dict],
     attn_weights: Optional[torch.Tensor],
 ) -> None:
-    """Store one prefill attention heatmap matrix for the selected layer."""
+    """Store prefill attention matrices for either one selected layer or all layers."""
     if not getattr(config, "attn_heatmap_mode", False):
         return
     if not is_prefill or heatmap_capture is None or attn_weights is None:
         return
-    if heatmap_capture.get("captured"):
-        return
     target_layer = getattr(config, "attn_heatmap_layer", None)
-    if target_layer is None or int(target_layer) != int(layer_idx):
+    if target_layer is not None and int(target_layer) != int(layer_idx):
         return
     if attn_weights.ndim != 4 or attn_weights.shape[0] == 0:
         return
 
-    heatmap_capture["captured"] = True
-    heatmap_capture["layer_idx"] = int(layer_idx)
-    heatmap_capture["matrix"] = (
+    matrices = heatmap_capture.setdefault("matrices", {})
+    if int(layer_idx) in matrices:
+        return
+    matrices[int(layer_idx)] = (
         attn_weights[0].mean(dim=0).detach().to(dtype=torch.float32).cpu()
     )
 
@@ -548,9 +547,8 @@ def CausalLM_forward(
         seq_state["next_compression"] = None
         if getattr(self.config, "attn_heatmap_mode", False):
             self._kvcomm_heatmap_captures[state_key] = {
-                "captured": False,
-                "layer_idx": getattr(self.config, "attn_heatmap_layer", None),
-                "matrix": None,
+                "layer_filter": getattr(self.config, "attn_heatmap_layer", None),
+                "matrices": {},
             }
     else:
         seq_state["length"] += input_len
