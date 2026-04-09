@@ -195,7 +195,7 @@ class AttentionSessionStore:
 
 
 def _viewer_html() -> str:
-    return """<!doctype html>
+    return r"""<!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8" />
@@ -375,6 +375,34 @@ def _viewer_html() -> str:
       padding: 1px 0;
       transition: background-color 120ms ease;
     }
+    .segment-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 12px;
+    }
+    .segment-chip {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px 10px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.78);
+      border: 1px solid var(--line);
+      color: var(--ink);
+      font-size: 12px;
+    }
+    .segment-chip-swatch {
+      width: 10px;
+      height: 10px;
+      border-radius: 999px;
+      flex: 0 0 auto;
+    }
+    .segment-empty {
+      color: var(--muted);
+      font-size: 13px;
+      margin-bottom: 12px;
+    }
     pre {
       margin: 0;
       white-space: pre-wrap;
@@ -465,6 +493,7 @@ def _viewer_html() -> str:
         </section>
         <section class="card">
           <h2 class="section-title">Prompt Tokens</h2>
+          <div id="segmentLegend" class="segment-legend"></div>
           <div id="promptTokens" class="prompt-tokens"></div>
         </section>
         <section class="card">
@@ -487,10 +516,14 @@ def _viewer_html() -> str:
       selectedLayerIndex: 0,
       vmin: 0,
       vmax: 1,
-      absMin: 0,
-      absMax: 1,
+      dataMin: 0,
+      dataMax: 1,
+      controlMin: 0,
+      controlMax: 1,
       robustMin: 0,
       robustMax: 1,
+      rangeInitialized: false,
+      promptSegments: [],
     };
 
     const runSelect = document.getElementById("runSelect");
@@ -510,9 +543,20 @@ def _viewer_html() -> str:
     const heatmapCanvas = document.getElementById("heatmapCanvas");
     const metaGrid = document.getElementById("metaGrid");
     const statsGrid = document.getElementById("statsGrid");
+    const segmentLegend = document.getElementById("segmentLegend");
     const promptTokens = document.getElementById("promptTokens");
     const responseText = document.getElementById("responseText");
     const status = document.getElementById("status");
+    const SEGMENT_COLORS = [
+      "#155d7a",
+      "#c06b2c",
+      "#4d7b3f",
+      "#914c8b",
+      "#8d4f2d",
+      "#2c6d6a",
+      "#a53f51",
+      "#586d9a",
+    ];
 
     function setStatus(message) {
       status.textContent = message || "";
@@ -564,17 +608,23 @@ def _viewer_html() -> str:
       return [r, g, b];
     }
 
-    function applyRangeToControls(minValue, maxValue, currentMin, currentMax) {
-      const safeMin = Number.isFinite(minValue) ? minValue : 0;
-      const safeMax = Number.isFinite(maxValue) && maxValue > safeMin ? maxValue : safeMin + 1e-6;
+    function applyRangeToControls(dataMin, dataMax, currentMin, currentMax) {
+      const safeDataMin = Number.isFinite(dataMin) ? dataMin : 0;
+      const safeDataMax = Number.isFinite(dataMax) && dataMax > safeDataMin ? dataMax : safeDataMin + 1e-6;
+      const safeCurrentMin = Number.isFinite(currentMin) ? currentMin : safeDataMin;
+      const safeCurrentMax = Number.isFinite(currentMax) ? currentMax : safeDataMax;
+      const safeMin = Math.min(safeDataMin, safeCurrentMin, safeCurrentMax);
+      const safeMax = Math.max(safeDataMax, safeCurrentMin, safeCurrentMax, safeMin + 1e-6);
       const step = Math.max((safeMax - safeMin) / 500, 1e-9);
       [vminSlider, vmaxSlider].forEach((slider) => {
         slider.min = String(safeMin);
         slider.max = String(safeMax);
         slider.step = String(step);
       });
-      state.absMin = safeMin;
-      state.absMax = safeMax;
+      state.dataMin = safeDataMin;
+      state.dataMax = safeDataMax;
+      state.controlMin = safeMin;
+      state.controlMax = safeMax;
       state.vmin = clamp(currentMin, safeMin, safeMax);
       state.vmax = clamp(currentMax, state.vmin, safeMax);
       vminInput.value = String(state.vmin);
@@ -590,19 +640,138 @@ def _viewer_html() -> str:
         nextMin = parseFloat(vminSlider.value);
         nextMax = parseFloat(vmaxSlider.value);
       }
-      nextMin = Number.isFinite(nextMin) ? nextMin : state.absMin;
-      nextMax = Number.isFinite(nextMax) ? nextMax : state.absMax;
+      nextMin = Number.isFinite(nextMin) ? nextMin : state.controlMin;
+      nextMax = Number.isFinite(nextMax) ? nextMax : state.controlMax;
       if (nextMin > nextMax) {
         if (source === "vmin") nextMax = nextMin;
         else nextMin = nextMax;
       }
-      state.vmin = clamp(nextMin, state.absMin, state.absMax);
-      state.vmax = clamp(nextMax, state.vmin, state.absMax);
+      state.vmin = clamp(nextMin, state.controlMin, state.controlMax);
+      state.vmax = clamp(nextMax, state.vmin, state.controlMax);
       vminInput.value = String(state.vmin);
       vmaxInput.value = String(state.vmax);
       vminSlider.value = String(state.vmin);
       vmaxSlider.value = String(state.vmax);
       renderLayerVisuals();
+    }
+
+    function skipWhitespace(text, index) {
+      let cursor = Math.max(0, index);
+      while (cursor < text.length && /\s/.test(text[cursor])) {
+        cursor += 1;
+      }
+      return cursor;
+    }
+
+    function detectAgentBlockContentOffset(blockText) {
+      const markers = [
+        "provides the following info:",
+        "output is:",
+        "his answer to this question is:",
+        "his answer to this question was:",
+        "The code written by the agent is:",
+      ];
+      for (const marker of markers) {
+        const markerIndex = blockText.indexOf(marker);
+        if (markerIndex >= 0) {
+          return skipWhitespace(blockText, markerIndex + marker.length);
+        }
+      }
+      const blankLineIndex = blockText.indexOf("\n\n");
+      if (blankLineIndex >= 0) {
+        return skipWhitespace(blockText, blankLineIndex + 2);
+      }
+      const colonIndex = blockText.indexOf(":");
+      if (colonIndex >= 0) {
+        return skipWhitespace(blockText, colonIndex + 1);
+      }
+      return 0;
+    }
+
+    function detectAgentBlockContentEnd(blockText, startOffset) {
+      const markers = [
+        "\n\n Whether it passes internal testing?",
+        "\n\nThe feedback is:",
+      ];
+      let endOffset = blockText.length;
+      for (const marker of markers) {
+        const markerIndex = blockText.indexOf(marker, startOffset);
+        if (markerIndex >= 0) {
+          endOffset = Math.min(endOffset, markerIndex);
+        }
+      }
+      while (endOffset > startOffset && /\s/.test(blockText[endOffset - 1])) {
+        endOffset -= 1;
+      }
+      return Math.max(startOffset, endOffset);
+    }
+
+    function inferAgentBlockSource(fullText, startIndex) {
+      const spatialMarker = fullText.lastIndexOf("At the same time", startIndex);
+      const temporalMarker = fullText.lastIndexOf("In the last round of dialogue", startIndex);
+      if (temporalMarker > spatialMarker) return "previous round";
+      if (spatialMarker >= 0) return "current round";
+      return "prompt";
+    }
+
+    function charIndexToTokenIndex(offsets, charIndex, fallbackIndex) {
+      if (!offsets.length) return 0;
+      for (let index = 0; index < offsets.length; index += 1) {
+        if (offsets[index].end > charIndex) {
+          return index;
+        }
+      }
+      return fallbackIndex;
+    }
+
+    function buildPromptSegments(tokens) {
+      if (!Array.isArray(tokens) || !tokens.length) {
+        return [];
+      }
+      const tokenTexts = tokens.map((token) => String(token ?? ""));
+      const offsets = [];
+      let cursor = 0;
+      tokenTexts.forEach((text) => {
+        offsets.push({ start: cursor, end: cursor + text.length });
+        cursor += text.length;
+      });
+      const fullText = tokenTexts.join("");
+      const blockPattern = /(?:^|\n)(Agent\s+([^\s,:\n]+)[\s\S]*?)(?=(?:\nAgent\s+[^\s,:\n]+(?:,| as a |:))|(?:<\|start_header_id\|>assistant)|(?:<\|im_start\|>assistant)|(?:\n\[ASSISTANT\])|$)/g;
+      const segments = [];
+      let match;
+      while ((match = blockPattern.exec(fullText)) !== null) {
+        const blockText = match[1];
+        const agentId = match[2];
+        if (!blockText || !agentId) continue;
+        const blockStart = match.index + (match[0].length - blockText.length);
+        const contentOffset = detectAgentBlockContentOffset(blockText);
+        const contentEndOffset = detectAgentBlockContentEnd(blockText, contentOffset);
+        const startChar = blockStart + contentOffset;
+        const endChar = blockStart + contentEndOffset;
+        if (endChar <= startChar) continue;
+        const startToken = charIndexToTokenIndex(offsets, startChar, offsets.length - 1);
+        const endToken = Math.max(
+          startToken + 1,
+          charIndexToTokenIndex(offsets, Math.max(startChar, endChar - 1), offsets.length - 1) + 1,
+        );
+        if (endToken <= startToken) continue;
+        const source = inferAgentBlockSource(fullText, blockStart);
+        segments.push({
+          agentId,
+          color: SEGMENT_COLORS[segments.length % SEGMENT_COLORS.length],
+          label: "Agent " + agentId + " (" + source + ")",
+          source,
+          startToken,
+          endToken,
+        });
+      }
+      return segments;
+    }
+
+    function segmentForToken(tokenIndex) {
+      return state.promptSegments.find(
+        (segment) => tokenIndex >= segment.startToken && tokenIndex < segment.endToken
+      ) || null;
     }
 
     function renderMetadata() {
@@ -655,13 +824,39 @@ def _viewer_html() -> str:
       tokens.forEach((token, index) => {
         const score = scores[index] ?? 0;
         const [r, g, b] = colorForValue(score, state.vmin, state.vmax);
+        const segment = segmentForToken(index);
         const span = document.createElement("span");
         span.className = "token";
         span.style.backgroundColor = "rgba(" + r + "," + g + "," + b + ",0.92)";
+        if (segment) {
+          span.style.boxShadow = "inset 0 -2px 0 " + segment.color;
+          span.title = segment.label + " | tokens [" + segment.startToken + ", " + segment.endToken + ")";
+        }
         span.textContent = token;
         fragment.appendChild(span);
       });
       promptTokens.appendChild(fragment);
+    }
+
+    function renderSegmentLegend() {
+      segmentLegend.innerHTML = "";
+      if (!state.promptSegments.length) {
+        const empty = document.createElement("div");
+        empty.className = "segment-empty";
+        empty.textContent = "No peer-agent prompt ranges detected for this prompt.";
+        segmentLegend.appendChild(empty);
+        return;
+      }
+      const fragment = document.createDocumentFragment();
+      state.promptSegments.forEach((segment) => {
+        const chip = document.createElement("span");
+        chip.className = "segment-chip";
+        chip.innerHTML =
+          '<span class="segment-chip-swatch" style="background:' + segment.color + '"></span>' +
+          "<span>" + segment.label + " [" + segment.startToken + ", " + segment.endToken + ")</span>";
+        fragment.appendChild(chip);
+      });
+      segmentLegend.appendChild(fragment);
     }
 
     function renderHeatmap() {
@@ -698,11 +893,46 @@ def _viewer_html() -> str:
       ctx.imageSmoothingEnabled = false;
       ctx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
       ctx.drawImage(offscreen, 0, 0, heatmapCanvas.width, heatmapCanvas.height);
+      if (state.promptSegments.length) {
+        ctx.save();
+        ctx.lineWidth = Math.max(1, Math.min(2, scale * 0.35));
+        state.promptSegments.forEach((segment) => {
+          const start = segment.startToken * scale;
+          const size = Math.max(1, (segment.endToken - segment.startToken) * scale);
+          const end = start + size;
+          ctx.strokeStyle = segment.color;
+          ctx.fillStyle = segment.color;
+          ctx.globalAlpha = 0.08;
+          ctx.fillRect(start, start, size, size);
+          ctx.globalAlpha = 0.95;
+          ctx.strokeRect(start + 0.5, start + 0.5, Math.max(0, size - 1), Math.max(0, size - 1));
+          ctx.setLineDash([Math.max(3, scale), Math.max(2, scale * 0.6)]);
+          if (segment.startToken > 0) {
+            ctx.beginPath();
+            ctx.moveTo(start, 0);
+            ctx.lineTo(start, heatmapCanvas.height);
+            ctx.moveTo(0, start);
+            ctx.lineTo(heatmapCanvas.width, start);
+            ctx.stroke();
+          }
+          if (segment.endToken < cols) {
+            ctx.beginPath();
+            ctx.moveTo(end, 0);
+            ctx.lineTo(end, heatmapCanvas.height);
+            ctx.moveTo(0, end);
+            ctx.lineTo(heatmapCanvas.width, end);
+            ctx.stroke();
+          }
+          ctx.setLineDash([]);
+        });
+        ctx.restore();
+      }
     }
 
     function renderLayerVisuals() {
       renderStats();
       renderHeatmap();
+      renderSegmentLegend();
       renderPromptTokens();
     }
 
@@ -733,11 +963,16 @@ def _viewer_html() -> str:
       const stats = state.layerData.matrix_stats || {};
       state.robustMin = stats.p1 ?? stats.min ?? 0;
       state.robustMax = stats.p99 ?? stats.max ?? 1;
+      if (!state.rangeInitialized) {
+        state.vmin = stats.min ?? 0;
+        state.vmax = stats.max ?? 1;
+        state.rangeInitialized = true;
+      }
       applyRangeToControls(
         stats.min ?? 0,
         stats.max ?? 1,
-        stats.min ?? 0,
-        stats.max ?? 1,
+        state.vmin,
+        state.vmax,
       );
       renderLayerVisuals();
       setStatus("Showing layer " + layerValue + ".");
@@ -753,6 +988,7 @@ def _viewer_html() -> str:
       setStatus("Loading agent detail...");
       const url = "/api/runs/" + runTag + "/requests/" + requestUid + "/agents/" + agentId + "?round_index=" + encodeURIComponent(state.selectedRound);
       state.agentDetail = await fetchJson(url);
+      state.promptSegments = buildPromptSegments(state.agentDetail?.tokens || []);
       state.selectedLayerIndex = 0;
       renderMetadata();
       await loadLayer();
@@ -892,12 +1128,12 @@ def _viewer_html() -> str:
     vmaxSlider.addEventListener("input", () => updateRangeFromInputs("slider"));
 
     resetRangeBtn.addEventListener("click", () => {
-      applyRangeToControls(state.absMin, state.absMax, state.absMin, state.absMax);
+      applyRangeToControls(state.dataMin, state.dataMax, state.dataMin, state.dataMax);
       renderLayerVisuals();
     });
 
     robustRangeBtn.addEventListener("click", () => {
-      applyRangeToControls(state.absMin, state.absMax, state.robustMin, state.robustMax);
+      applyRangeToControls(state.dataMin, state.dataMax, state.robustMin, state.robustMax);
       renderLayerVisuals();
     });
 

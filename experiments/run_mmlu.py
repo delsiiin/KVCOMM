@@ -87,7 +87,7 @@ def parse_args():
     parser.add_argument("--attn-heatmap-layer", type=int, default=None, help="Optional layer filter for prefill attention visualization capture.")
     parser.add_argument("--model-dtype", type=str, default="float16", help="Model load dtype: float16/bfloat16/float32/auto.")
     parser.add_argument("--plot-length-hist", dest="plot_length_hist", action="store_true", default=False, help="Plot per-agent input/output length histograms.")
-    parser.add_argument("--num_rounds", type=int, default=1, help="Number of graph execution rounds for each arun call.")
+    parser.add_argument("--num-rounds", type=int, default=1, help="Number of graph execution rounds for each arun call.")
 
     args = parser.parse_args()
     result_path = Path(args.output_dir)
@@ -142,7 +142,7 @@ async def main():
 
     download()
     dataset_val = MMLUDataset("val")
-    limit_questions = 2
+    limit_questions = 153
     configure_logging(log_path=output_dir / "logs" / f"log_{runtime_tag}.txt")
     score = await evaluate(
         graph=graph,
