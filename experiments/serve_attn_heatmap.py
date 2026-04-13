@@ -9,7 +9,14 @@ import numpy as np
 sys.path.append(str(Path(__file__).resolve().parents[1]))
 
 from KVCOMM.utils.attention_heatmap import (
+    ATTENTION_STAGE_COMBINED,
+    ATTENTION_STAGE_GENERATION,
+    ATTENTION_STAGE_PREFILL,
+    ATTENTION_VIEW_STAGES,
+    build_combined_attention_matrix,
+    compute_matrix_stats,
     compute_token_scores,
+    normalize_detail_payload,
     sanitize_filename_component,
 )
 
@@ -20,6 +27,21 @@ def _load_json(path: Path) -> Dict[str, Any]:
     if not isinstance(payload, dict):
         raise ValueError(f"Expected object JSON in {path}")
     return payload
+
+
+def _matrix_to_jsonable(matrix: np.ndarray) -> List[List[Optional[float]]]:
+    matrix_np = np.asarray(matrix, dtype=np.float32)
+    if matrix_np.ndim != 2:
+        raise ValueError(f"Expected 2D matrix, got shape {tuple(matrix_np.shape)}")
+    rows: List[List[Optional[float]]] = []
+    for row in matrix_np:
+        rows.append(
+            [
+                float(value) if np.isfinite(value) else None
+                for value in row.tolist()
+            ]
+        )
+    return rows
 
 
 class AttentionSessionStore:
@@ -45,6 +67,25 @@ class AttentionSessionStore:
         payload.setdefault("run_tag", run_dir.name)
         payload.setdefault("calls", [])
         return payload
+
+    def _load_stage_matrices(self, npz_path: Path) -> Dict[str, Dict[int, np.ndarray]]:
+        stage_matrices: Dict[str, Dict[int, np.ndarray]] = {
+            ATTENTION_STAGE_PREFILL: {},
+            ATTENTION_STAGE_GENERATION: {},
+        }
+        with np.load(npz_path) as matrices:
+            for key in matrices.files:
+                matrix = matrices[key].astype(np.float32)
+                if key.startswith(f"{ATTENTION_STAGE_PREFILL}_layer_"):
+                    layer_idx = int(key.split("_")[-1])
+                    stage_matrices[ATTENTION_STAGE_PREFILL][layer_idx] = matrix
+                elif key.startswith(f"{ATTENTION_STAGE_GENERATION}_layer_"):
+                    layer_idx = int(key.split("_")[-1])
+                    stage_matrices[ATTENTION_STAGE_GENERATION][layer_idx] = matrix
+                elif key.startswith("layer_"):
+                    layer_idx = int(key.split("_")[-1])
+                    stage_matrices[ATTENTION_STAGE_PREFILL][layer_idx] = matrix
+        return stage_matrices
 
     def _find_run_dir(self, run_tag: str) -> Optional[Path]:
         safe_run_tag = sanitize_filename_component(run_tag)
@@ -87,6 +128,7 @@ class AttentionSessionStore:
                     "agent_name": call.get("agent_name"),
                     "agent_role": call.get("agent_role"),
                     "available_layers": call.get("available_layers", []),
+                    "available_stages": call.get("available_stages", [ATTENTION_STAGE_PREFILL]),
                 }
             )
         requests: List[Dict[str, Any]] = []
@@ -148,7 +190,7 @@ class AttentionSessionStore:
         detail_path = run_dir / str(call["json_path"])
         payload = _load_json(detail_path)
         payload["run_tag"] = run_tag
-        return payload
+        return normalize_detail_payload(payload)
 
     def get_layer_payload(
         self,
@@ -158,6 +200,7 @@ class AttentionSessionStore:
         agent_id: str,
         round_index: Optional[int],
         layer_idx: int,
+        stage: str = ATTENTION_STAGE_COMBINED,
     ) -> Dict[str, Any]:
         run_dir, call = self._find_call(
             run_tag=run_tag,
@@ -166,16 +209,35 @@ class AttentionSessionStore:
             round_index=round_index,
         )
         detail_path = run_dir / str(call["json_path"])
-        detail_payload = _load_json(detail_path)
+        detail_payload = normalize_detail_payload(_load_json(detail_path))
         npz_path = run_dir / str(call["npz_path"])
-        with np.load(npz_path) as matrices:
-            key = f"layer_{int(layer_idx)}"
-            if key not in matrices:
-                raise FileNotFoundError(
-                    f"Layer {layer_idx} not found for run={run_tag} request={request_uid} agent={agent_id}"
-                )
-            matrix = matrices[key].astype(np.float32)
+        stage_name = (stage or ATTENTION_STAGE_COMBINED).strip().lower()
+        if stage_name not in ATTENTION_VIEW_STAGES:
+            raise ValueError(
+                f"Unsupported stage: {stage}. Supported stages: {', '.join(ATTENTION_VIEW_STAGES)}."
+            )
+        stage_matrices = self._load_stage_matrices(npz_path)
+        prefill_matrix = stage_matrices.get(ATTENTION_STAGE_PREFILL, {}).get(int(layer_idx))
+        generation_matrix = stage_matrices.get(ATTENTION_STAGE_GENERATION, {}).get(int(layer_idx))
+        if stage_name == ATTENTION_STAGE_COMBINED:
+            matrix = build_combined_attention_matrix(
+                prefill_matrix=prefill_matrix,
+                generation_matrix=generation_matrix,
+            )
+        elif stage_name == ATTENTION_STAGE_PREFILL:
+            matrix = prefill_matrix
+        else:
+            matrix = generation_matrix
+        if matrix is None:
+            raise FileNotFoundError(
+                f"Layer {layer_idx} stage={stage_name} not found for run={run_tag} request={request_uid} agent={agent_id}"
+            )
         token_scores = compute_token_scores(matrix)
+        stage_stats = (
+            (detail_payload.get("stage_matrix_stats") or {}).get(stage_name, {}).get(str(int(layer_idx)))
+        )
+        if stage_stats is None:
+            stage_stats = compute_matrix_stats(matrix)
         return {
             "run_tag": run_tag,
             "request_uid": request_uid,
@@ -184,13 +246,19 @@ class AttentionSessionStore:
             "agent_name": detail_payload.get("agent_name"),
             "agent_role": detail_payload.get("agent_role"),
             "layer_idx": int(layer_idx),
+            "stage": stage_name,
             "available_layers": detail_payload.get("available_layers", []),
+            "available_stages": detail_payload.get("available_stages", [ATTENTION_STAGE_PREFILL]),
             "matrix_shape": list(matrix.shape),
-            "matrix_stats": (detail_payload.get("matrix_stats") or {}).get(str(int(layer_idx)), {}),
-            "tokens": detail_payload.get("tokens", []),
-            "token_ids": detail_payload.get("token_ids", []),
+            "matrix_stats": stage_stats,
+            "tokens": detail_payload.get("full_tokens", detail_payload.get("tokens", [])),
+            "token_ids": detail_payload.get("full_token_ids", detail_payload.get("token_ids", [])),
+            "prompt_tokens": detail_payload.get("prompt_tokens", []),
+            "response_tokens": detail_payload.get("response_tokens", []),
+            "prompt_token_len": detail_payload.get("input_token_len", 0),
+            "response_token_len": detail_payload.get("output_token_len", 0),
             "token_scores": token_scores,
-            "matrix": matrix.tolist(),
+            "matrix": _matrix_to_jsonable(matrix),
         }
 
 
@@ -432,7 +500,7 @@ def _viewer_html() -> str:
   <div class="shell">
     <section class="hero">
       <h1>KVCOMM Attention Viewer</h1>
-      <p>Browse structured prefill attention captures by run, request, round, agent, and layer. The heatmap color range and prompt token shading update live on the page.</p>
+      <p>Browse combined prefill and generation attention captures by run, request, round, agent, and layer. The heatmap color range and token shading update live on the page.</p>
     </section>
     <div class="layout">
       <aside class="card controls">
@@ -785,8 +853,9 @@ def _viewer_html() -> str:
         ["Agent", detail.agent_id],
         ["Name", detail.agent_name || "n/a"],
         ["Role", detail.agent_role || "n/a"],
-        ["Prompt Tokens", detail.input_token_len ?? detail.tokens?.length ?? 0],
+        ["Prompt Tokens", detail.input_token_len ?? detail.prompt_tokens?.length ?? 0],
         ["Response Tokens", detail.output_token_len ?? 0],
+        ["Stages", (detail.available_stages || []).join(", ") || "prefill"],
       ];
       items.forEach(([label, value]) => {
         const box = document.createElement("div");
@@ -818,17 +887,22 @@ def _viewer_html() -> str:
 
     function renderPromptTokens() {
       promptTokens.innerHTML = "";
-      const tokens = state.layerData?.tokens || state.agentDetail?.tokens || [];
+      const tokens = state.layerData?.tokens || state.agentDetail?.full_tokens || state.agentDetail?.tokens || [];
       const scores = state.layerData?.token_scores || [];
+      const promptLength = Number(state.layerData?.prompt_token_len ?? state.agentDetail?.input_token_len ?? 0);
       const fragment = document.createDocumentFragment();
       tokens.forEach((token, index) => {
         const score = scores[index] ?? 0;
-        const [r, g, b] = colorForValue(score, state.vmin, state.vmax);
+        const isFiniteScore = Number.isFinite(score);
+        const [r, g, b] = isFiniteScore ? colorForValue(score, state.vmin, state.vmax) : [235, 232, 224];
         const segment = segmentForToken(index);
         const span = document.createElement("span");
         span.className = "token";
         span.style.backgroundColor = "rgba(" + r + "," + g + "," + b + ",0.92)";
-        if (segment) {
+        if (index >= promptLength) {
+          span.style.border = "1px solid rgba(21, 93, 122, 0.18)";
+        }
+        if (segment && index < promptLength) {
           span.style.boxShadow = "inset 0 -2px 0 " + segment.color;
           span.title = segment.label + " | tokens [" + segment.startToken + ", " + segment.endToken + ")";
         }
@@ -878,7 +952,10 @@ def _viewer_html() -> str:
       let ptr = 0;
       for (let y = 0; y < rows; y += 1) {
         for (let x = 0; x < cols; x += 1) {
-          const [r, g, b] = colorForValue(matrix[y][x], state.vmin, state.vmax);
+          const value = matrix[y][x];
+          const [r, g, b] = Number.isFinite(value)
+            ? colorForValue(value, state.vmin, state.vmax)
+            : [231, 226, 216];
           image.data[ptr++] = r;
           image.data[ptr++] = g;
           image.data[ptr++] = b;
@@ -893,6 +970,21 @@ def _viewer_html() -> str:
       ctx.imageSmoothingEnabled = false;
       ctx.clearRect(0, 0, heatmapCanvas.width, heatmapCanvas.height);
       ctx.drawImage(offscreen, 0, 0, heatmapCanvas.width, heatmapCanvas.height);
+      const promptLength = Number(state.layerData?.prompt_token_len ?? state.agentDetail?.input_token_len ?? 0);
+      if (promptLength > 0 && promptLength < cols) {
+        const divider = promptLength * scale;
+        ctx.save();
+        ctx.strokeStyle = "rgba(21, 93, 122, 0.95)";
+        ctx.lineWidth = Math.max(1, Math.min(3, scale * 0.45));
+        ctx.setLineDash([Math.max(4, scale * 1.25), Math.max(2, scale * 0.75)]);
+        ctx.beginPath();
+        ctx.moveTo(divider, 0);
+        ctx.lineTo(divider, heatmapCanvas.height);
+        ctx.moveTo(0, divider);
+        ctx.lineTo(heatmapCanvas.width, divider);
+        ctx.stroke();
+        ctx.restore();
+      }
       if (state.promptSegments.length) {
         ctx.save();
         ctx.lineWidth = Math.max(1, Math.min(2, scale * 0.35));
@@ -958,7 +1050,7 @@ def _viewer_html() -> str:
       const runTag = encodeURIComponent(state.selectedRun);
       const requestUid = encodeURIComponent(state.selectedRequest);
       const agentId = encodeURIComponent(state.selectedAgent);
-      const url = "/api/runs/" + runTag + "/requests/" + requestUid + "/agents/" + agentId + "/layers/" + layerValue + "?round_index=" + encodeURIComponent(state.selectedRound);
+      const url = "/api/runs/" + runTag + "/requests/" + requestUid + "/agents/" + agentId + "/layers/" + layerValue + "?round_index=" + encodeURIComponent(state.selectedRound) + "&stage=combined";
       state.layerData = await fetchJson(url);
       const stats = state.layerData.matrix_stats || {};
       state.robustMin = stats.p1 ?? stats.min ?? 0;
@@ -992,7 +1084,7 @@ def _viewer_html() -> str:
       setStatus("Loading agent detail...");
       const url = "/api/runs/" + runTag + "/requests/" + requestUid + "/agents/" + agentId + "?round_index=" + encodeURIComponent(state.selectedRound);
       state.agentDetail = await fetchJson(url);
-      state.promptSegments = buildPromptSegments(state.agentDetail?.tokens || []);
+      state.promptSegments = buildPromptSegments(state.agentDetail?.prompt_tokens || []);
       const layers = state.agentDetail?.available_layers || [];
       if (!layers.length) {
         state.selectedLayerIndex = 0;
@@ -1213,6 +1305,7 @@ def create_app(session_root: str | Path):
         agent_id: str,
         layer_idx: int,
         round_index: Optional[int] = Query(default=None),
+        stage: str = Query(default=ATTENTION_STAGE_COMBINED),
     ) -> Dict[str, Any]:
         try:
             return store.get_layer_payload(
@@ -1221,6 +1314,7 @@ def create_app(session_root: str | Path):
                 agent_id=agent_id,
                 round_index=round_index,
                 layer_idx=layer_idx,
+                stage=stage,
             )
         except FileNotFoundError as exc:
             raise HTTPException(status_code=404, detail=str(exc)) from exc

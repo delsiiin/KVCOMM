@@ -408,8 +408,12 @@ class LLMChat(LLM):
         capture = captures.pop(state_key, None)
         if not isinstance(capture, dict):
             return None
-        matrices = capture.get("matrices")
-        if not isinstance(matrices, dict) or not matrices:
+        prefill = capture.get("prefill")
+        generation = capture.get("generation")
+        has_prefill = isinstance(prefill, dict) and bool(prefill)
+        has_generation = isinstance(generation, dict) and bool(generation)
+        has_legacy = isinstance(capture.get("matrices"), dict) and bool(capture.get("matrices"))
+        if not (has_prefill or has_generation or has_legacy):
             return None
         return capture
 
@@ -423,6 +427,80 @@ class LLMChat(LLM):
         token_ids = [int(token_id) for token_id in input_ids_tensor[0].detach().cpu().tolist()]
         token_texts = decode_token_texts(self.tokenizer, token_ids)
         return token_ids, token_texts
+
+    def _extract_generated_tokens(
+        self,
+        generated_sequence: torch.Tensor,
+    ) -> tuple[list[int], list[str]]:
+        if not isinstance(generated_sequence, torch.Tensor) or generated_sequence.ndim != 2:
+            return [], []
+        token_ids = [int(token_id) for token_id in generated_sequence[0].detach().cpu().tolist()]
+        token_texts = decode_token_texts(self.tokenizer, token_ids)
+        return token_ids, token_texts
+
+    def _infer_past_key_values_length(self, past_key_values: Any) -> Optional[int]:
+        if past_key_values is None:
+            return None
+        get_seq_length = getattr(past_key_values, "get_seq_length", None)
+        if callable(get_seq_length):
+            try:
+                length = int(get_seq_length())
+                if length >= 0:
+                    return length
+            except Exception:
+                pass
+        try:
+            first_layer = past_key_values[0]
+            if isinstance(first_layer, (tuple, list)) and len(first_layer) > 0:
+                key_cache = first_layer[0]
+            else:
+                key_cache = first_layer
+            if isinstance(key_cache, torch.Tensor) and key_cache.ndim >= 3:
+                return int(key_cache.shape[-2])
+        except Exception:
+            return None
+        return None
+
+    def _complete_generation_attention_capture_if_needed(
+        self,
+        *,
+        outputs: Any,
+        kvcomm_state_key: Optional[str],
+    ) -> None:
+        if not self.attn_heatmap_mode or not kvcomm_state_key or outputs is None:
+            return
+        sequences = getattr(outputs, "sequences", None)
+        past_key_values = getattr(outputs, "past_key_values", None)
+        if not isinstance(sequences, torch.Tensor) or sequences.ndim != 2 or sequences.shape[-1] == 0:
+            return
+        if past_key_values is None:
+            return
+        past_length = self._infer_past_key_values_length(past_key_values)
+        if past_length is None:
+            return
+        if past_length >= int(sequences.shape[1]):
+            return
+        cache_position = torch.arange(
+            past_length,
+            int(sequences.shape[1]),
+            dtype=torch.long,
+            device=sequences.device,
+        )
+        if cache_position.numel() == 0:
+            return
+        attention_mask = torch.ones_like(sequences, device=sequences.device)
+        model_inputs = self.model.prepare_inputs_for_generation(
+            sequences,
+            past_key_values=past_key_values,
+            attention_mask=attention_mask,
+            cache_position=cache_position,
+            use_cache=True,
+            kvcomm_state_key=kvcomm_state_key,
+        )
+        model_inputs["return_dict"] = True
+        model_inputs["output_attentions"] = True
+        with torch.no_grad():
+            self.model(**model_inputs)
 
     def _export_attention_heatmap_if_needed(
         self,
@@ -439,6 +517,8 @@ class LLMChat(LLM):
         input_token_texts: list[str],
         input_token_len: Optional[int],
         output_token_len: Optional[int],
+        response_token_ids: list[int],
+        response_token_texts: list[str],
     ) -> Optional[Dict[str, Any]]:
         if not self.attn_heatmap_mode:
             return None
@@ -455,7 +535,7 @@ class LLMChat(LLM):
             )
             return None
         return export_attention_visualization(
-            matrices=capture.get("matrices", {}),
+            capture=capture,
             output_dir=self.attn_heatmap_output_dir,
             run_tag=self.attn_heatmap_run_tag,
             request_uid=request_uid,
@@ -469,6 +549,8 @@ class LLMChat(LLM):
             input_token_texts=input_token_texts,
             input_token_len=input_token_len,
             output_token_len=output_token_len,
+            response_token_ids=response_token_ids,
+            response_token_texts=response_token_texts,
         )
 
     def gen(
@@ -498,6 +580,12 @@ class LLMChat(LLM):
         try:
             outputs = self.model.generate(**inputs, **generation_kwargs)
             generated_sequence = outputs.sequences[:, prompt_length:]
+            generated_token_ids, generated_token_texts = self._extract_generated_tokens(generated_sequence)
+            if generated_token_ids:
+                self._complete_generation_attention_capture_if_needed(
+                    outputs=outputs,
+                    kvcomm_state_key=kvcomm_state_key,
+                )
             response_message = self.tokenizer.decode(
                 generated_sequence[0], skip_special_tokens=True
             ).strip()
@@ -514,6 +602,8 @@ class LLMChat(LLM):
                 input_token_texts=prompt_token_texts,
                 input_token_len=int(prompt_length),
                 output_token_len=int(generated_sequence.shape[-1]),
+                response_token_ids=generated_token_ids,
+                response_token_texts=generated_token_texts,
             )
         finally:
             if kvcomm_state_key is not None:
@@ -570,6 +660,12 @@ class LLMChat(LLM):
             try:
                 outputs = self.model.generate(**inputs, **generation_kwargs)
                 generated_sequence = outputs.sequences[:, prompt_length:]
+                generated_token_ids, generated_token_texts = self._extract_generated_tokens(generated_sequence)
+                if generated_token_ids:
+                    self._complete_generation_attention_capture_if_needed(
+                        outputs=outputs,
+                        kvcomm_state_key=kvcomm_state_key,
+                    )
                 response_message = self.tokenizer.decode(
                     generated_sequence[0], skip_special_tokens=True
                 ).strip()
@@ -586,6 +682,8 @@ class LLMChat(LLM):
                     input_token_texts=prompt_token_texts,
                     input_token_len=int(prompt_length),
                     output_token_len=int(generated_sequence.shape[-1]),
+                    response_token_ids=generated_token_ids,
+                    response_token_texts=generated_token_texts,
                 )
             finally:
                 if kvcomm_state_key is not None:

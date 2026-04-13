@@ -40,7 +40,7 @@ KV_COMPRESSION_MAP = {
 logger = logging.get_logger(__name__)
 
 
-def _capture_prefill_attention_heatmap(
+def _capture_attention_heatmap(
     *,
     config,
     layer_idx: int,
@@ -48,10 +48,10 @@ def _capture_prefill_attention_heatmap(
     heatmap_capture: Optional[dict],
     attn_weights: Optional[torch.Tensor],
 ) -> None:
-    """Store prefill attention matrices for either one selected layer or all layers."""
+    """Store per-layer attention matrices for prefill and generation stages."""
     if not getattr(config, "attn_heatmap_mode", False):
         return
-    if not is_prefill or heatmap_capture is None or attn_weights is None:
+    if heatmap_capture is None or attn_weights is None:
         return
     target_layer = getattr(config, "attn_heatmap_layer", None)
     if target_layer is not None and int(target_layer) != int(layer_idx):
@@ -59,12 +59,20 @@ def _capture_prefill_attention_heatmap(
     if attn_weights.ndim != 4 or attn_weights.shape[0] == 0:
         return
 
-    matrices = heatmap_capture.setdefault("matrices", {})
-    if int(layer_idx) in matrices:
+    matrix = attn_weights[0].mean(dim=0).detach().to(dtype=torch.float32).cpu()
+    if is_prefill:
+        prefill_matrices = heatmap_capture.setdefault("prefill", {})
+        if int(layer_idx) in prefill_matrices:
+            return
+        prefill_matrices[int(layer_idx)] = matrix
         return
-    matrices[int(layer_idx)] = (
-        attn_weights[0].mean(dim=0).detach().to(dtype=torch.float32).cpu()
-    )
+
+    generation_rows = heatmap_capture.setdefault("generation", {}).setdefault(int(layer_idx), [])
+    if matrix.ndim == 1:
+        generation_rows.append(matrix)
+    elif matrix.ndim == 2:
+        for row_idx in range(matrix.shape[0]):
+            generation_rows.append(matrix[row_idx])
 
 def repeat_kv(hidden_states: torch.Tensor, n_rep: int) -> torch.Tensor:
     """
@@ -267,7 +275,7 @@ def LlamaAttention_forward(
         scaling=self.scaling,
         **kwargs,
     )
-    _capture_prefill_attention_heatmap(
+    _capture_attention_heatmap(
         config=self.config,
         layer_idx=self.layer_idx,
         is_prefill=bool(kvcomm_is_prefill),
@@ -466,7 +474,7 @@ def Qwen2Attention_forward(
         sliding_window=sliding_window,  # main diff with Llama
         **kwargs,
     )
-    _capture_prefill_attention_heatmap(
+    _capture_attention_heatmap(
         config=self.config,
         layer_idx=self.layer_idx,
         is_prefill=bool(kvcomm_is_prefill),
@@ -548,7 +556,8 @@ def CausalLM_forward(
         if getattr(self.config, "attn_heatmap_mode", False):
             self._kvcomm_heatmap_captures[state_key] = {
                 "layer_filter": getattr(self.config, "attn_heatmap_layer", None),
-                "matrices": {},
+                "prefill": {},
+                "generation": {},
             }
     else:
         seq_state["length"] += input_len
